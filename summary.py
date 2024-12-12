@@ -25,19 +25,16 @@ class ChannelSummarizer(commands.Bot):
         # Create aiohttp session
         self.session = None
 
-        # Categories to monitor
-        self.category_ids = [
-            1212472332484870224,
-            1138787029170258001,
-            1307827932147744868,
-            1275200515407609940,
-            1147226523187822713,            
-            1221869948469776516,
-            1076117621407223830
-        ]
-        self.summary_channel_id = 1316024582041243668
+        # Get configuration from environment variables
+        categories_str = os.getenv('CATEGORIES_TO_MONITOR')
+        self.category_ids = [int(cat_id) for cat_id in categories_str.split(',')]
+        self.summary_channel_id = int(os.getenv('SUMMARY_CHANNEL_ID'))
+        self.guild_id = int(os.getenv('GUILD_ID'))
 
-        print("Bot initialized")
+        print("Bot initialized with:")
+        print(f"Guild ID: {self.guild_id}")
+        print(f"Summary Channel: {self.summary_channel_id}")
+        print(f"Categories to monitor: {len(self.category_ids)} categories")
 
     async def get_channel_history(self, channel_id):
         print(f"Attempting to get history for channel {channel_id}")
@@ -129,7 +126,7 @@ While here's an example of what a good summary and topic should look like:
 • 🏋️ **Person Training for Hunyuan Video is Now Possible**
     - Users are experimenting with training LoRAs using images and videos
     - **Kytra** explained that training can be done on relatively modest hardware (24GB VRAM): <https://discord.com/channels/1076117621407223829/1316079815446757396/1316418253102383135>
-    - **TDRussell** provided the repository link: https://github.com/tdrussell/diffusion-pipe
+    - **TDRussell** provided the repository link: <https://github.com/tdrussell/diffusion-pipe>
 
 And here's another example of a good summary and topic:
 
@@ -142,13 +139,14 @@ And here's another example of a good summary and topic:
 Format requirements:
 1. Make sure to ALWAYS include relevant message Discord AND external links as references in this format: <message_url>
 2. Use Discord's markdown format (not regular markdown)
-3. Use • for main topics and properly indented - for sub-points (4 spaces before the -)
-4. Use ** for bold text (especially for usernames and main topics)
-5. Keep it simple - just bullet points and sub-points for each topic, no headers or complex formatting
-6. ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
-7. Always include a funny or relevant emoji in the topic title
-8. Highlight messages with significant reactions (3+ reactions) and mention the reaction counts
-9. Use 🔥 to indicate highly-reacted messages (5+ total reactions)
+3. For links, always surround them with < and > - like this: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011>
+4. Use • for main topics and properly indented - for sub-points (4 spaces before the -)
+5. Use ** for bold text (especially for usernames and main topics)
+6. Keep it simple - just bullet points and sub-points for each topic, no headers or complex formatting
+7. ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
+8. Always include a funny or relevant emoji in the topic title
+9. Highlight messages with significant reactions (3+ reactions) and mention the reaction counts
+10. Use 🔥 to indicate highly-reacted messages (5+ total reactions)
 
 IMPORTANT: For each bullet point, use the EXACT message URL provided in the data - do not write <message_url> but instead use the actual URL from the message data.
 
@@ -405,16 +403,25 @@ def main():
     # Load environment variables from .env file
     load_dotenv()
     
-    # Load environment variables
+    # Load and validate environment variables
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
     anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+    guild_id = os.getenv('GUILD_ID')
+    summary_channel_id = os.getenv('SUMMARY_CHANNEL_ID')
+    categories_to_monitor = os.getenv('CATEGORIES_TO_MONITOR')
     
     if not bot_token:
         raise ValueError("Discord bot token not found in environment variables")
     if not anthropic_key:
         raise ValueError("Anthropic API key not found in environment variables")
+    if not guild_id:
+        raise ValueError("Guild ID not found in environment variables")
+    if not summary_channel_id:
+        raise ValueError("Summary channel ID not found in environment variables")
+    if not categories_to_monitor:
+        raise ValueError("Categories to monitor not found in environment variables")
         
-    # Create bot instance
+    # Create and run the bot
     bot = ChannelSummarizer()
     
     # Create event loop

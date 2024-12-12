@@ -1,0 +1,4 @@
+discord.py>=2.3.0
+anthropic
+python-dotenv>=1.0.0
+aiohttp>=3.9.0 

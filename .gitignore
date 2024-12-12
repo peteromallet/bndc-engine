@@ -1,0 +1,35 @@
+# Environment variables
+.env
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+.python-version
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
+logs/
