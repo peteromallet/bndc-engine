@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import io
 import time
 import aiohttp
+import argparse
 
 class ChannelSummarizer(commands.Bot):
     def __init__(self):
@@ -116,28 +117,8 @@ class ChannelSummarizer(commands.Bot):
 
 If there's nothing significant or noteworthy in the messages, just respond with exactly "[NOTHING OF NOTE]" (and no other text).
 
-Here are bad topics to cover:
-- Bug reports that seem unremarkable and not useful to others
-- Messages that are not helpful or informative to others
-- Discussions that ultimately have no real value to others
-- Humourous messages that are not helpful or informative to others
-
-While here's an example of what a good summary and topic should look like:
-• 🏋️ **Person Training for Hunyuan Video is Now Possible**
-    - Users are experimenting with training LoRAs using images and videos
-    - **Kytra** explained that training can be done on relatively modest hardware (24GB VRAM): <https://discord.com/channels/1076117621407223829/1316079815446757396/1316418253102383135>
-    - **TDRussell** provided the repository link: <https://github.com/tdrussell/diffusion-pipe>
-
-And here's another example of a good summary and topic:
-
-• 🤏 **H264/H265 Compression Techniques for Video Generation Improves Img2Vid**
-    - **zeevfarbman** recommended h265 compression for frame degradation with less perceptual impact: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011>
-    - **johndopamine** suggested using h264 node in MTB node pack for better video generation
-    - Codec compression can help "trick" current workflows/models
-    - melmass confirmed adding h265 support to their tools: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316786801247260672>
-
 Format requirements:
-1. Make sure to ALWAYS include relevant message Discord AND external links as references in this format: <message_url>
+1. Make sure to ALWAYS try to include relevant links to external links and Discord links. Use this format: <message_url>
 2. Use Discord's markdown format (not regular markdown)
 3. For links, always surround them with < and > - like this: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011>
 4. Use • for main topics and properly indented - for sub-points (4 spaces before the -)
@@ -145,8 +126,33 @@ Format requirements:
 6. Keep it simple - just bullet points and sub-points for each topic, no headers or complex formatting
 7. ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
 8. Always include a funny or relevant emoji in the topic title
-9. Highlight messages with significant reactions (3+ reactions) and mention the reaction counts
-10. Use 🔥 to indicate highly-reacted messages (5+ total reactions)
+
+While here's an example of what a good summary and topic should look like:
+• 🏋️ **Person Training for Hunyuan Video is Now Possible**    
+    - **Kytra** explained that training can be done on relatively modest hardware (24GB VRAM): <https://discord.com/channels/1076117621407223829/1316079815446757396/1316418253102383135>
+    - **TDRussell** provided the repository link: <https://github.com/tdrussell/diffusion-pipe>
+    - Banodocians are generally experimenting with training LoRAs using images and videos
+
+And here's another example of a good summary and topic:
+
+• 🤏 **H264/H265 Compression Techniques for Video Generation Improves Img2Vid**
+    - **zeevfarbman** recommended h265 compression for frame degradation with less perceptual impact: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011>
+    - **johndopamine** suggested using h264 node in MTB node pack for better video generation
+    - Codec compression can help "trick" current workflows/models: <https://github.com/tdrussell/codex-pipe?
+    - melmass confirmed adding h265 support to their tools: <https://discord.com/channels/1076117621407223829/1309520535012638740/1316786801247260672>
+
+While here are bad topics to cover:
+- Bug reports that seem unremarkable and not useful to others
+- Messages that are not helpful or informative to others
+- Discussions that ultimately have no real value to others
+- Humourous messages that are not helpful or informative to others
+
+Remember:
+
+1. Only include topics that are likele to be interesting and noteworthy
+2. You MUST ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
+2. You MUST ALWAYS include relevant links to external links and Discord linkl
+4. You MUST ALWAYS use Discord's markdown format (not regular markdown)
 
 IMPORTANT: For each bullet point, use the EXACT message URL provided in the data - do not write <message_url> but instead use the actual URL from the message data.
 
@@ -164,7 +170,7 @@ Please provide the summary now:\n\n"""
         while retry_count < max_retries:
             try:
                 response = self.claude.messages.create(
-                    model="claude-3-5-sonnet-latest",
+                    model="claude-3-5-haiku-latest",
                     max_tokens=8192,
                     messages=[
                         {
@@ -187,11 +193,81 @@ Please provide the summary now:\n\n"""
                     print("All retry attempts failed")
                     return "An error occurred while generating the summary."
 
-    async def post_summary(self, channel_id, summary):
+    def get_short_summary(self, full_summary, message_count):
+        if "[NOTHING OF NOTE]" in full_summary:
+            return f"__📨 {message_count} messages sent__\n\nNo significant activity in the past 24 hours"
+
+        conversation = f"""Create exactly 3 bullet points summarizing key developments. STRICT format requirements:
+1. The FIRST LINE MUST BE EXACTLY: __📨 {message_count} messages sent__
+2. Then three bullet points that:
+   - Start with •
+   - Bold the most important finding/result/insight using **
+   - Keep each to a single line
+3. DO NOT MODIFY THE MESSAGE COUNT OR FORMAT IN ANY WAY
+
+Required format:
+__📨 {message_count} messages sent__
+• Video Generation shows **45% better performance with new prompting technique**
+• Training Process now requires **only 8GB VRAM with optimized pipeline**
+• Model Architecture changes **reduce hallucinations by 60%**
+
+DO NOT CHANGE THE MESSAGE COUNT LINE. IT MUST BE EXACTLY AS SHOWN ABOVE.
+
+Full summary to work from:
+{full_summary}"""
+
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                response = self.claude.messages.create(
+                    model="claude-3-5-sonnet-latest",
+                    max_tokens=1024,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": conversation
+                        }
+                    ]
+                )
+                
+                return response.content[0].text.strip()
+            except Exception as e:
+                retry_count += 1
+                print(f"Error attempt {retry_count}/{max_retries} while generating short summary: {e}")
+                if retry_count < max_retries:
+                    print(f"Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print("All retry attempts failed")
+                    return f"Channel had {message_count} messages in the past 24 hours. Error generating detailed summary."
+
+    async def post_summary(self, channel_id, summary, source_channel_name, message_count):
         print(f"Attempting to post summary to channel {channel_id}")
         channel = self.get_channel(channel_id)
         if channel:
             try:
+                # Generate short summary first
+                short_summary = self.get_short_summary(summary, message_count)
+                
+                # Get the source channel object to get its ID
+                source_channel = discord.utils.get(self.get_all_channels(), name=source_channel_name.strip('#'))
+                
+                # Get current date for thread name
+                current_date = datetime.utcnow()
+                thread_name = f"Summary for #{source_channel_name} for {current_date.strftime('%A, %B %d')}"
+                
+                if source_channel:
+                    # Use the source channel's ID for the mention with ## heading
+                    initial_message = await channel.send(f"## <#{source_channel.id}>\n{short_summary}")
+                else:
+                    # Fallback to just the name if we can't find the channel
+                    initial_message = await channel.send(f"## {source_channel_name}\n{short_summary}")
+                
+                # Create thread from the initial message
+                thread = await initial_message.create_thread(name=thread_name)
+                
                 # Collect all files from referenced messages
                 all_files = []
                 for message_id, cache_data in self.attachment_cache.items():
@@ -241,21 +317,21 @@ Please provide the summary now:\n\n"""
                     if current_chunk:
                         chunks.append(current_chunk)
                     
-                    # Send first chunk with files
+                    # Send first chunk with files in the thread
                     if files:
-                        await channel.send(chunks[0], files=files)
+                        await thread.send(f"\n{chunks[0]}", files=files)
                     else:
-                        await channel.send(chunks[0])
+                        await thread.send(f"\n{chunks[0]}")
                     
-                    # Send remaining chunks
+                    # Send remaining chunks in the thread
                     for chunk in chunks[1:]:
-                        await channel.send(chunk)
+                        await thread.send(chunk)
                 else:
                     # Send everything in one message if it's short enough
                     if files:
-                        await channel.send(summary, files=files)
+                        await thread.send(f"\n{summary}", files=files)
                     else:
-                        await channel.send(summary)
+                        await thread.send(f"\n{summary}")
                 
                 print(f"Successfully posted summary to {channel.name}")
             except Exception as e:
@@ -276,29 +352,9 @@ Please provide the summary now:\n\n"""
             
             # Track if we've found any active channels
             active_channels = False
+            date_header_posted = False
             
-            # Get current date in the desired format
-            current_date = datetime.utcnow()
-            date_string = current_date.strftime("%A, %B %d")  # e.g., "Monday, October 28"
-            # Add the ordinal suffix (th, st, nd, rd)
-            day = current_date.day
-            if day in (1, 21, 31):
-                suffix = "st"
-            elif day in (2, 22):
-                suffix = "nd"
-            elif day in (3, 23):
-                suffix = "rd"
-            else:
-                suffix = "th"
-            
-            try:
-                await summary_channel.send(f"# Summary for {date_string}{suffix}")
-                print("Posted header message successfully")
-            except Exception as e:
-                print(f"Failed to post header: {e}")
-                return
-            
-            # Iterate through each category
+            # Process each category
             for category_id in self.category_ids:
                 category = self.get_channel(category_id)
                 if not category:
@@ -307,7 +363,6 @@ Please provide the summary now:\n\n"""
                 
                 print(f"\nProcessing category: {category.name}")
                 
-                # Get all text channels in this category
                 channels = [channel for channel in category.channels 
                           if isinstance(channel, discord.TextChannel)]
                 
@@ -327,10 +382,17 @@ Please provide the summary now:\n\n"""
                             
                             # Only post if there's something noteworthy
                             if "[NOTHING OF NOTE]" not in summary:
+                                # Post date header if this is the first active channel
+                                if not date_header_posted:
+                                    current_date = datetime.utcnow()
+                                    date_string = current_date.strftime("%A, %B %d")
+                                    day = current_date.day
+                                    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+                                    await summary_channel.send(f"# 📝 Summary for {date_string}{suffix}")
+                                    date_header_posted = True
+                                
                                 active_channels = True
-                                # Send channel-specific header before the summary
-                                await summary_channel.send(f"# <#{channel.id}> Summary\n")
-                                await self.post_summary(self.summary_channel_id, summary)
+                                await self.post_summary(self.summary_channel_id, summary, channel.name, len(messages))
                                 # Add line break between channel summaries
                                 await summary_channel.send("───────────────────────")
                                 
@@ -403,6 +465,11 @@ def main():
     # Load environment variables from .env file
     load_dotenv()
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Discord Channel Summarizer Bot')
+    parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately instead of waiting for scheduled time')
+    args = parser.parse_args()
+    
     # Load and validate environment variables
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
     anthropic_key = os.getenv('ANTHROPIC_API_KEY')
@@ -427,14 +494,20 @@ def main():
     # Create event loop
     loop = asyncio.get_event_loop()
     
-    # Modify the on_ready event to start the scheduler
+    # Modify the on_ready event to handle immediate execution if requested
     @bot.event
     async def on_ready():
         print(f"Logged in as {bot.user.name} ({bot.user.id})")
         print("Connected to servers:", [guild.name for guild in bot.guilds])
         
-        # Start the scheduler
-        loop.create_task(schedule_daily_summary(bot))
+        if args.run_now:
+            print("Running summary process immediately...")
+            await bot.generate_summary()
+            print("Summary process completed. Shutting down...")
+            await bot.close()
+        else:
+            # Start the scheduler for regular operation
+            loop.create_task(schedule_daily_summary(bot))
     
     # Run the bot
     try:
