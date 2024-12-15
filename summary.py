@@ -13,8 +13,9 @@ import re
 import logging
 import traceback
 import random
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Dict, Optional, Any
 import ssl
+from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(
@@ -113,6 +114,121 @@ class RateLimiter:
                 logger.debug(traceback.format_exc())
                 raise
 
+class Attachment:
+    def __init__(self, filename: str, data: bytes, content_type: str, reaction_count: int, username: str):
+        self.filename = filename
+        self.data = data
+        self.content_type = content_type
+        self.reaction_count = reaction_count
+        self.username = username
+
+class MessageData:
+    def __init__(self, content: str, author: str, timestamp: datetime, jump_url: str, reactions: int, id: str, attachments: List[Attachment]):
+        self.content = content
+        self.author = author
+        self.timestamp = timestamp
+        self.jump_url = jump_url
+        self.reactions = reactions
+        self.id = id
+        self.attachments = attachments
+
+class AttachmentHandler:
+    def __init__(self, max_size: int = 25 * 1024 * 1024):
+        self.max_size = max_size
+        self.attachment_cache: Dict[str, Dict[str, Any]] = {}
+
+    async def process_attachment(self, attachment: discord.Attachment, message: discord.Message, session: aiohttp.ClientSession) -> Optional[Attachment]:
+        """Process a single attachment with size and type validation."""
+        try:
+            async with session.get(attachment.url, timeout=300) as response:
+                if response.status != 200:
+                    raise APIError(f"Failed to download attachment: HTTP {response.status}")
+                
+                file_data = await response.read()
+                if len(file_data) > self.max_size:
+                    logger.warning(f"Skipping large file {attachment.filename} ({len(file_data)/1024/1024:.2f}MB)")
+                    return None
+
+                return Attachment(
+                    filename=attachment.filename,
+                    data=file_data,
+                    content_type=attachment.content_type,
+                    reaction_count=len({user.id async for reaction in message.reactions for user in reaction.users()}),
+                    username=message.author.name
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+            return None
+
+    async def prepare_files(self, message_ids: List[str], limit: int = 10) -> List[Tuple[discord.File, int, str, str]]:
+        """Prepare Discord files from cached attachments."""
+        files = []
+        for message_id in message_ids:
+            if message_id in self.attachment_cache:
+                for attachment in self.attachment_cache[message_id]['attachments']:
+                    try:
+                        file = discord.File(
+                            io.BytesIO(attachment.data),
+                            filename=attachment.filename,
+                            description=f"From message ID: {message_id} (🔥 {attachment.reaction_count} reactions)"
+                        )
+                        files.append((
+                            file,
+                            attachment.reaction_count,
+                            message_id,
+                            attachment.username
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to prepare file {attachment.filename}: {e}")
+                        continue
+
+        return sorted(files, key=lambda x: x[1], reverse=True)[:limit]
+
+class MessageFormatter:
+    @staticmethod
+    def format_usernames(usernames: List[str]) -> str:
+        """Format a list of usernames with proper grammar."""
+        unique_usernames = list(dict.fromkeys(usernames))
+        if not unique_usernames:
+            return ""
+        if len(unique_usernames) == 1:
+            return unique_usernames[0]  # Already contains ** formatting
+        return f"{', '.join(unique_usernames[:-1])} and {unique_usernames[-1]}"  # Preserves ** formatting
+
+    @staticmethod
+    def chunk_content(content: str, max_length: int = 1900) -> List[Tuple[str, Set[str]]]:
+        """Split content into chunks while preserving message links."""
+        chunks = []
+        current_chunk = ""
+        current_chunk_links = set()
+
+        for line in content.split('\n'):
+            message_links = set(re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', line))
+            
+            # Start new chunk if we hit emoji or length limit
+            if (any(line.startswith(emoji) for emoji in ['🎥', '💻', '🎬', '🤖', '📱', '💡', '🔧', '🎨', '📊']) and 
+                current_chunk):
+                if current_chunk:
+                    chunks.append((current_chunk, current_chunk_links))
+                current_chunk = ""
+                current_chunk_links = set()
+                current_chunk += '\n---\n\n'
+
+            if len(current_chunk) + len(line) + 2 <= max_length:
+                current_chunk += line + '\n'
+                current_chunk_links.update(message_links)
+            else:
+                if current_chunk:
+                    chunks.append((current_chunk, current_chunk_links))
+                current_chunk = line + '\n'
+                current_chunk_links = set(message_links)
+
+        if current_chunk:
+            chunks.append((current_chunk, current_chunk_links))
+
+        return chunks
+
 class ChannelSummarizer(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -121,7 +237,15 @@ class ChannelSummarizer(commands.Bot):
         intents.messages = True
         intents.members = True
         intents.presences = True
-        super().__init__(command_prefix="!", intents=intents)
+
+        # Add websocket parameters to prevent timeouts
+        super().__init__(
+            command_prefix="!", 
+            intents=intents,
+            heartbeat_timeout=60.0,  # Increase from default 60s
+            guild_ready_timeout=10.0,
+            gateway_queue_size=512
+        )
         
         # Initialize Anthropic client
         self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
@@ -145,6 +269,9 @@ class ChannelSummarizer(commands.Bot):
         # Add this to your existing __init__
         self.rate_limiter = RateLimiter()
 
+        self.attachment_handler = AttachmentHandler()
+        self.message_formatter = MessageFormatter()
+
     async def get_channel_history(self, channel_id):
         """
         Retrieve message history for a channel with comprehensive error handling.
@@ -155,17 +282,27 @@ class ChannelSummarizer(commands.Bot):
             if not channel:
                 raise DiscordError(f"Could not find channel with ID {channel_id}")
             
+            # Skip channels with 'support' in the name
+            if 'support' in channel.name.lower():
+                logger.info(f"Skipping support channel: {channel.name}")
+                return []
+            
             yesterday = datetime.utcnow() - timedelta(days=1)
             messages = []
             self.attachment_cache = {}
             
             async for message in channel.history(after=yesterday, limit=None):
                 try:
-                    total_reactions = sum(reaction.count for reaction in message.reactions)
+                    # Count unique reactors instead of total reactions
+                    unique_reactors = set()
+                    for reaction in message.reactions:
+                        async for user in reaction.users():
+                            unique_reactors.add(user.id)  # Use user ID to ensure uniqueness
+                    total_unique_reactors = len(unique_reactors)
                     
                     # Handle attachments
                     if message.attachments and (
-                        total_reactions >= 3 or 
+                        total_unique_reactors >= 3 or 
                         any(attachment.filename.lower().endswith(('.mp4', '.mov', '.webm')) 
                             for attachment in message.attachments)
                     ):
@@ -180,7 +317,8 @@ class ChannelSummarizer(commands.Bot):
                                                 'filename': attachment.filename,
                                                 'data': file_data,
                                                 'content_type': attachment.content_type,
-                                                'reaction_count': total_reactions
+                                                'reaction_count': total_unique_reactors,
+                                                'username': message.author.name
                                             })
                                         else:
                                             logger.warning(f"Skipping large file {attachment.filename} "
@@ -198,7 +336,8 @@ class ChannelSummarizer(commands.Bot):
                         if attachments:
                             self.attachment_cache[str(message.id)] = {
                                 'attachments': attachments,
-                                'reaction_count': total_reactions
+                                'reaction_count': total_unique_reactors,
+                                'username': message.author.name
                             }
                     
                     # Process message content
@@ -212,7 +351,7 @@ class ChannelSummarizer(commands.Bot):
                         'author': message.author.name,
                         'timestamp': message.created_at,
                         'jump_url': message.jump_url,
-                        'reactions': total_reactions,
+                        'reactions': total_unique_reactors,  # Now using unique reactors count
                         'id': str(message.id)
                     })
                     
@@ -253,7 +392,10 @@ class ChannelSummarizer(commands.Bot):
             return "[NOTHING OF NOTE]"
         
         logger.info(f"Generating summary for {len(messages)} messages")
-        conversation = """Please summarize the interesting and noteworthy Discord happenings and ideas in bullet points. You should extract ideas and information that may be useful to others from conversations AND discord links or URLS. Avoid stuff like bug reports that are circumstantial or not useful to others. Break them into topics and sub-topics with relevant links - Discord links or URLS.
+        
+        try:
+            # Build the conversation prompt
+            conversation = """Please summarize the interesting and noteworthy Discord happenings and ideas in bullet points. ALWAYS include Discord links and external links. You should extract ideas and information that may be useful to others from conversations. Avoid stuff like bug reports that are circumstantial or not useful to others. Break them into topics and sub-topics.
 
 If there's nothing significant or noteworthy in the messages, just respond with exactly "[NOTHING OF NOTE]" (and no other text). Always include external links and Discord links wherever possible.
 
@@ -300,23 +442,20 @@ Remember:
 
 IMPORTANT: For each bullet point, use the EXACT message URL provided in the data - do not write <message_url> but instead use the actual URL from the message data.
 
-Please provide the summary now - don't include any other text:\n\n"""
+Please provide the summary now - don't include any other text or explanation:\n\n"""
         
-        for msg in messages:
-            conversation += f"{msg['timestamp']} - {msg['author']}: {msg['content']}"
-            if msg['reactions']:
-                conversation += f"\nReactions: {msg['reactions']}"
-            conversation += f"\Discord link: {msg['jump_url']}\n\n"
+            for msg in messages:
+                conversation += f"{msg['timestamp']} - {msg['author']}: {msg['content']}"
+                if msg['reactions']:
+                    conversation += f"\nReactions: {msg['reactions']}"
+                conversation += f"\nDiscord link: {msg['jump_url']}\n\n"
+
+            loop = asyncio.get_running_loop()
             
-        max_retries = 3
-        retry_count = 0
-        backoff_time = 1  # Initial backoff time in seconds
-        
-        while retry_count < max_retries:
-            try:
-                # Add timeout parameter
-                response = self.claude.messages.create(
-                    model="claude-3-5-haiku-latest",
+            # Define a helper function to call the synchronous Claude API method
+            def create_summary():
+                return self.claude.messages.create(
+                    model="claude-3-5-sonnet-latest",
                     max_tokens=8192,
                     messages=[
                         {
@@ -324,63 +463,51 @@ Please provide the summary now - don't include any other text:\n\n"""
                             "content": conversation
                         }
                     ],
-                    timeout=60  # 60 second timeout
+                    timeout=120  # 120-second timeout
                 )
+            
+            # Run the synchronous create_summary in a separate thread to avoid blocking
+            response = await loop.run_in_executor(None, create_summary)
+            
+            logger.debug(f"Response type: {type(response)}")
+            logger.debug(f"Response content: {response.content}")
+            
+            # Ensure the response has the expected structure
+            if not hasattr(response, 'content') or not response.content:
+                raise ValueError("Invalid response format from Claude API.")
+
+            summary_text = response.content[0].text.strip()
+            logger.info("Summary generated successfully")
+            return summary_text
                 
-                summary_text = response.content[0].text.strip()
-                logger.info("Summary generated successfully")
-                return summary_text
-                
-            except anthropic.APIError as e:
-                retry_count += 1
-                logger.error(f"Claude API error (attempt {retry_count}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    wait_time = backoff_time * (2 ** (retry_count - 1))  # Exponential backoff
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("All retry attempts failed")
-                    raise APIError(f"Claude API failed after {max_retries} attempts: {e}")
-                    
-            except anthropic.RateLimitError as e:
-                retry_count += 1
-                logger.warning(f"Rate limit hit (attempt {retry_count}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    wait_time = e.retry_after if hasattr(e, 'retry_after') else backoff_time * (2 ** (retry_count - 1))
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise APIError("Rate limit exceeded and max retries reached")
-                    
-            except (TimeoutError, ssl.SSLError, ConnectionError) as e:
-                retry_count += 1
-                logger.error(f"Network error (attempt {retry_count}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    wait_time = backoff_time * (2 ** (retry_count - 1))
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise APIError(f"Network error after {max_retries} attempts: {e}")
-                    
-            except Exception as e:
-                logger.error(f"Unexpected error generating summary: {e}")
-                logger.debug(traceback.format_exc())
-                raise SummaryError(f"Unexpected error during summary generation: {e}")
+        except asyncio.CancelledError:
+            logger.info("Summary generation cancelled - shutting down gracefully")
+            raise
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt detected - shutting down gracefully")
+            raise
+        except Exception as e:
+            logger.error(f"Error generating summary: {e}")
+            logger.debug(traceback.format_exc())
+            raise
 
-        # If we get here, all retries failed
-        raise APIError(f"Failed to generate summary after {max_retries} attempts")
-
-    def get_short_summary(self, full_summary, message_count):
-        if "[NOTHING OF NOTE]" in full_summary:
-            return f"__📨 {message_count} messages sent__\n\nNo significant activity in the past 24 hours"
-
-        conversation = f"""Create exactly 3 bullet points summarizing key developments. STRICT format requirements:
+    async def get_short_summary(self, full_summary: str, message_count: int) -> str:
+        """
+        Get a short summary using Claude with proper async handling.
+        """
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                conversation = f"""Create exactly 3 bullet points summarizing key developments. STRICT format requirements:
 1. The FIRST LINE MUST BE EXACTLY: __📨 {message_count} messages sent__
 2. Then three bullet points that:
    - Start with -
    - Bold the most important finding/result/insight using **
    - Keep each to a single line
-3. DO NOT MODIFY THE MESSAGE COUNT OR FORMAT IN ANY WAY
+3. Then EXACTLY one blank line with only a zero-width space
+4. DO NOT MODIFY THE MESSAGE COUNT OR FORMAT IN ANY WAY
 
 Required format:
 "__📨 {message_count} messages sent__
@@ -388,61 +515,93 @@ Required format:
 • Video Generation shows **45% better performance with new prompting technique**
 • Training Process now requires **only 8GB VRAM with optimized pipeline**
 • Model Architecture changes **reduce hallucinations by 60%**
+\u200B
 "
 DO NOT CHANGE THE MESSAGE COUNT LINE. IT MUST BE EXACTLY AS SHOWN ABOVE. DO NOT ADD INCLUDE ELSE IN THE MESSAGE OTHER THAN THE ABOVE.
 
 Full summary to work from:
 {full_summary}"""
 
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                response = self.claude.messages.create(
-                    model="claude-3-5-sonnet-latest",
-                    max_tokens=1024,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": conversation
-                        }
-                    ]
-                )
+                loop = asyncio.get_running_loop()
+                
+                # Define a helper function to call the synchronous Claude API method
+                def create_short_summary():
+                    return self.claude.messages.create(
+                        model="claude-3-5-haiku-latest",
+                        max_tokens=8192,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": conversation
+                            }
+                        ]
+                    )
+                
+                # Run the synchronous create_summary in a separate thread to avoid blocking
+                response = await loop.run_in_executor(None, create_short_summary)
                 
                 return response.content[0].text.strip()
+                    
+            except asyncio.TimeoutError:
+                retry_count += 1
+                logger.error(f"Timeout attempt {retry_count}/{max_retries} while generating short summary")
+                if retry_count < max_retries:
+                    logger.info(f"Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    logger.error("All retry attempts failed")
+                    return f"__📨 {message_count} messages sent__\n\n• Error generating summary\n\u200B"
+                    
             except Exception as e:
                 retry_count += 1
                 logger.error(f"Error attempt {retry_count}/{max_retries} while generating short summary: {e}")
                 if retry_count < max_retries:
                     logger.info(f"Retrying in 5 seconds...")
-                    time.sleep(5)
+                    await asyncio.sleep(5)
                 else:
                     logger.error("All retry attempts failed")
-                    return f"Channel had {message_count} messages in the past 24 hours. Error generating detailed summary."
+                    return f"__📨 {message_count} messages sent__\n\n• Error generating summary\n\u200B"
 
     async def send_initial_message(self, channel, short_summary: str, source_channel_name: str) -> discord.Message:
         """
-        Send the initial summary message to the channel.
-        
-        Args:
-            channel: Discord channel to send message to
-            short_summary: Condensed version of the summary
-            source_channel_name: Name of the channel being summarized
-            
-        Returns:
-            discord.Message: The sent message object
+        Send the initial summary message to the channel with top reacted media if available.
         """
         try:
             # Get the source channel object to get its ID
             source_channel = discord.utils.get(self.get_all_channels(), name=source_channel_name.strip('#'))
             
+            # Prepare the message content
             if source_channel:
-                message_content = f"## <#{source_channel.id}>\n\n{short_summary}"
+                message_content = f"## <#{source_channel.id}>\n\u200B\n{short_summary}"
             else:
-                message_content = f"## {source_channel_name}\n\n{short_summary}"
-                
-            return await self.safe_send_message(channel, message_content)
+                message_content = f"## {source_channel_name}\n\u200B\n{short_summary}"
+            
+            # Find the most reacted media file
+            top_media = None
+            top_reactions = 2  # Minimum reaction threshold
+            
+            for message_id, cache_data in self.attachment_cache.items():
+                if cache_data['reaction_count'] > top_reactions:
+                    for attachment in cache_data['attachments']:
+                        if any(attachment['filename'].lower().endswith(ext) 
+                              for ext in ('.png', '.jpg', '.jpeg', '.gif', '.mp4', '.mov', '.webm')):
+                            top_media = attachment
+                            top_reactions = cache_data['reaction_count']
+            
+            # If we found popular media, attach it to the message
+            initial_message = None
+            if top_media:
+                file = discord.File(
+                    io.BytesIO(top_media['data']),
+                    filename=top_media['filename'],
+                    description=f"Most popular media (🔥 {top_reactions} reactions)"
+                )
+                initial_message = await self.safe_send_message(channel, message_content, file=file)
+            else:
+                initial_message = await self.safe_send_message(channel, message_content)
+            
+            logger.info(f"Initial message sent successfully: {initial_message.id if initial_message else 'None'}")
+            return initial_message
             
         except Exception as e:
             logger.error(f"Failed to send initial message: {e}")
@@ -461,18 +620,32 @@ Full summary to work from:
             discord.Thread: The created thread
         """
         try:
+            if not message:
+                logger.error("Cannot create thread: message is None")
+                raise ValueError("Message cannot be None")
+            
+            logger.info(f"Creating thread for message {message.id}")
             current_date = datetime.utcnow()
             thread_name = f"Summary for #{source_channel_name} for {current_date.strftime('%A, %B %d')}"
-            thread = await self.safe_create_thread(message, name=thread_name)
-            await self.safe_send_message(thread, "──────────────────────")
-            return thread
+            
+            try:
+                thread = await message.create_thread(name=thread_name)
+                logger.info(f"Thread created successfully: {thread.id}")
+                await self.safe_send_message(thread, "─────────────────────")
+                return thread
+            except discord.Forbidden as e:
+                logger.error(f"Bot lacks permissions to create thread: {e}")
+                raise DiscordError("Insufficient permissions to create thread")
+            except discord.HTTPException as e:
+                logger.error(f"Failed to create thread: {e}")
+                raise DiscordError(f"Failed to create thread: {e}")
             
         except Exception as e:
             logger.error(f"Failed to create summary thread: {e}")
             logger.debug(traceback.format_exc())
             raise DiscordError(f"Failed to create summary thread: {e}")
 
-    async def prepare_topic_files(self, topic: str) -> List[Tuple[discord.File, int, str]]:
+    async def prepare_topic_files(self, topic: str) -> List[Tuple[discord.File, int, str, str]]:
         """
         Prepare files for a given topic.
         
@@ -480,7 +653,7 @@ Full summary to work from:
             topic: The topic text to process
             
         Returns:
-            List of tuples containing (discord.File, reaction_count, message_id)
+            List of tuples containing (discord.File, reaction_count, message_id, username)
         """
         topic_files = []
         message_links = re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', topic)
@@ -498,7 +671,8 @@ Full summary to work from:
                             topic_files.append((
                                 file,
                                 self.attachment_cache[message_id]['reaction_count'],
-                                message_id
+                                message_id,
+                                self.attachment_cache[message_id].get('username', 'Unknown')  # Add username
                             ))
                     except Exception as e:
                         logger.error(f"Failed to prepare file {attachment['filename']}: {e}")
@@ -506,144 +680,90 @@ Full summary to work from:
                         
         return sorted(topic_files, key=lambda x: x[1], reverse=True)[:10]  # Limit to top 10 files
 
-    async def send_topic_chunk(self, thread: discord.Thread, chunk: str, files: List[discord.File] = None):
+    async def send_topic_chunk(self, thread: discord.Thread, chunk: str, files: List[Tuple[discord.File, int, str, str]] = None):
         """
         Send a chunk of topic content to the thread.
         
         Args:
             thread: Thread to send content to
             chunk: Content to send
-            files: Optional list of files to attach
+            files: Optional list of tuples containing (discord.File, reaction_count, message_id, username)
         """
         try:
             if files:
-                await self.safe_send_message(thread, chunk, files=files)
+                # Get list of usernames in order of their attachments
+                usernames = [f"**{file_tuple[3]}**" for file_tuple in files]  # Access username from tuple
+                unique_usernames = []
+                [unique_usernames.append(x) for x in usernames if x not in unique_usernames]
+                
+                # Format usernames with 'and' and ':'
+                if len(unique_usernames) > 1:
+                    formatted_usernames = f"{', '.join(unique_usernames[:-1])} and {unique_usernames[-1]}"
+                else:
+                    formatted_usernames = unique_usernames[0]
+                
+                # Only add the header if this chunk has files
+                if "Related attachments" not in chunk:
+                    chunk = f"{chunk}\nRelated attachments from {formatted_usernames}:"
+                
+                await self.safe_send_message(thread, chunk, files=[file_tuple[0] for file_tuple in files])
             else:
                 await self.safe_send_message(thread, chunk)
         except Exception as e:
             logger.error(f"Failed to send topic chunk: {e}")
             logger.debug(traceback.format_exc())
 
-    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False) -> None:
-        """
-        Process and send a single topic to the thread.
-        
-        Args:
-            thread: Thread to send topic to
-            topic: Topic content to process
-            is_first: Whether this is the first topic
-        """
+    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False) -> Set[str]:
+        """Process and send a single topic to the thread."""
         if not topic.strip():
-            return
+            return set()
 
         # Format topic header
-        if is_first:
-            formatted_topic = f"### {topic}"
-        else:
-            formatted_topic = f"---\n### {topic}"
+        formatted_topic = ("---\n" if not is_first else "") + f"### {topic}"
 
-        # Split topic if it's too long
-        max_length = 1900
-        if len(formatted_topic) > max_length:
-            chunks = []
-            current_chunk = ""
-            current_chunk_links = set()
-            
-            for line in formatted_topic.split('\n'):
-                # Check if line contains a Discord message link
-                message_links = re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', line)
-                
-                # Start new chunk if we hit emoji or length limit
-                if (any(line.startswith(emoji) for emoji in ['🎥', '💻', '🎬', '🤖', '📱', '💡', '🔧', '🎨', '📊']) and 
-                    current_chunk):
-                    if current_chunk:
-                        chunks.append((current_chunk, current_chunk_links))
-                    current_chunk = ""
-                    current_chunk_links = set()
-                    current_chunk += '\n---\n\n'
+        # Extract all message IDs from the topic
+        message_links = re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', topic)
+        used_message_ids = set(message_links)
 
-                if len(current_chunk) + len(line) + 2 <= max_length:
-                    current_chunk += line + '\n'
-                    current_chunk_links.update(message_links)
-                else:
-                    if current_chunk:
-                        chunks.append((current_chunk, current_chunk_links))
-                    current_chunk = line + '\n'
-                    current_chunk_links = set(message_links)
-                    
-            if current_chunk:
-                chunks.append((current_chunk, current_chunk_links))
+        # Split topic into chunks
+        chunks = self.message_formatter.chunk_content(formatted_topic)
 
-            # Send chunks with their associated files
-            for chunk, chunk_links in chunks:
-                # Prepare files for this chunk
-                chunk_files = []
-                for message_id in chunk_links:
-                    if message_id in self.attachment_cache:
-                        for attachment in self.attachment_cache[message_id]['attachments']:
-                            try:
-                                if len(attachment['data']) <= 25 * 1024 * 1024:  # 25MB limit
-                                    file = discord.File(
-                                        io.BytesIO(attachment['data']),
-                                        filename=attachment['filename'],
-                                        description=f"From message ID: {message_id} (🔥 {self.attachment_cache[message_id]['reaction_count']} reactions)"
-                                    )
-                                    chunk_files.append(file)
-                            except Exception as e:
-                                logger.error(f"Failed to prepare file {attachment['filename']}: {e}")
-                                continue
-                
-                # Send chunk with its associated files
-                await self.send_topic_chunk(thread, chunk, files=chunk_files[:10] if chunk_files else None)
-            
-        else:
-            # Format topic with horizontal rules
-            lines = formatted_topic.split('\n')
-            formatted_lines = []
-            current_chunk = ""
-            current_chunk_links = set()
-            chunks = []
-            
-            for i, line in enumerate(lines):
-                # Check for Discord message links in the line
-                message_links = re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', line)
-                
-                if i > 0 and any(line.startswith(emoji) for emoji in ['🎥', '💻', '🎬', '🤖', '📱', '💡', '🔧', '🎨', '📊']):
-                    if current_chunk:
-                        chunks.append((current_chunk, current_chunk_links))
-                    current_chunk = ""
-                    current_chunk_links = set()
-                    current_chunk += '\n---\n'
-                
-                current_chunk += line + '\n'
-                current_chunk_links.update(message_links)
-                
-            if current_chunk:
-                chunks.append((current_chunk, current_chunk_links))
-                
-            # Send each chunk with its associated files
-            for chunk, chunk_links in chunks:
-                # Prepare files for this chunk
-                chunk_files = []
-                for message_id in chunk_links:
-                    if message_id in self.attachment_cache:
-                        for attachment in self.attachment_cache[message_id]['attachments']:
-                            try:
-                                if len(attachment['data']) <= 25 * 1024 * 1024:  # 25MB limit
-                                    file = discord.File(
-                                        io.BytesIO(attachment['data']),
-                                        filename=attachment['filename'],
-                                        description=f"From message ID: {message_id} (🔥 {self.attachment_cache[message_id]['reaction_count']} reactions)"
-                                    )
-                                    chunk_files.append(file)
-                            except Exception as e:
-                                logger.error(f"Failed to prepare file {attachment['filename']}: {e}")
-                                continue
-                
-                # Send chunk with its associated files
-                await self.send_topic_chunk(thread, chunk, files=chunk_files[:10] if chunk_files else None)
+        for chunk_content, chunk_links in chunks:
+            # Get files specifically related to the messages mentioned in this chunk
+            chunk_files = []
+            for message_id in chunk_links:
+                if message_id in self.attachment_cache:
+                    for attachment in self.attachment_cache[message_id]['attachments']:
+                        try:
+                            file = discord.File(
+                                io.BytesIO(attachment['data']),
+                                filename=attachment['filename'],
+                                description=f"From message ID: {message_id} (🔥 {self.attachment_cache[message_id]['reaction_count']} reactions)"
+                            )
+                            chunk_files.append((
+                                file,
+                                self.attachment_cache[message_id]['reaction_count'],
+                                message_id,
+                                self.attachment_cache[message_id].get('username', 'Unknown')
+                            ))
+                        except Exception as e:
+                            logger.error(f"Failed to prepare file {attachment['filename']}: {e}")
+                            continue
 
-        await asyncio.sleep(1)  # Prevent rate limiting
+            # Sort files by reaction count and limit to top 10
+            chunk_files.sort(key=lambda x: x[1], reverse=True)
+            chunk_files = chunk_files[:10]
+
+            if chunk_files:
+                # Format usernames for the attachment section
+                usernames = [file[3] for file in chunk_files]
+                formatted_usernames = self.message_formatter.format_usernames(usernames)
+                if "Related attachments" not in chunk_content:
+                    chunk_content = f"{chunk_content}\nRelated attachments from {formatted_usernames}:"
+
+            await self.send_topic_chunk(thread, chunk_content, chunk_files)
+
+        return used_message_ids
 
     async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str]):
         """
@@ -654,6 +774,7 @@ Full summary to work from:
             used_message_ids: Set of message IDs that have already been processed
         """
         unused_attachments = []
+        
         for message_id, cache_data in self.attachment_cache.items():
             if message_id not in used_message_ids and cache_data['reaction_count'] >= 3:
                 for attachment in cache_data['attachments']:
@@ -664,25 +785,38 @@ Full summary to work from:
                                 filename=attachment['filename'],
                                 description=f"From message ID: {message_id} (🔥 {cache_data['reaction_count']} reactions)"
                             )
-                            unused_attachments.append((file, cache_data['reaction_count']))
+                            unused_attachments.append((
+                                file, 
+                                cache_data['reaction_count'],
+                                message_id,
+                                cache_data.get('username', 'Unknown')
+                            ))
                     except Exception as e:
                         logger.error(f"Failed to prepare unused attachment: {e}")
                         continue
 
         if unused_attachments:
-            unused_attachments.sort(key=lambda x: x[1], reverse=True)
-            files = [file for file, _ in unused_attachments[:10]]
-            await self.safe_send_message(thread, "**📎 Other Popular Attachments**", files=files)
+            unused_attachments.sort(key=lambda x: x[1], reverse=True)  # Sort by reaction count
+            # Get usernames in order of appearance
+            usernames = [f"{attachment[3]}" for attachment in unused_attachments]
+            unique_usernames = []
+            [unique_usernames.append(x) for x in usernames if x not in unique_usernames]
+            
+            # Format usernames with 'and' and ':'
+            if len(unique_usernames) > 1:
+                formatted_usernames = f"{', '.join(unique_usernames[:-1])} and {unique_usernames[-1]}"
+            else:
+                formatted_usernames = unique_usernames[0]
+            
+            await self.safe_send_message(
+                thread, 
+                f"\n\n---\n**\u200bOther popular attachments from {formatted_usernames}:**",
+                files=[file[0] for file in unused_attachments[:10]]
+            )
 
     async def post_summary(self, channel_id: int, summary: str, source_channel_name: str, message_count: int):
         """
         Post a complete summary to a Discord channel.
-        
-        Args:
-            channel_id: ID of the channel to post to
-            summary: Full summary content
-            source_channel_name: Name of the source channel
-            message_count: Number of messages processed
         """
         logger.info(f"Attempting to post summary to channel {channel_id}")
         
@@ -694,7 +828,7 @@ Full summary to work from:
                 raise DiscordError(f"Could not find channel with ID {target_channel_id}")
 
             # Generate and post initial summary
-            short_summary = self.get_short_summary(summary, message_count)
+            short_summary = await self.get_short_summary(summary, message_count)
             initial_message = await self.send_initial_message(channel, short_summary, source_channel_name)
             
             # Create thread for detailed summary
@@ -706,13 +840,11 @@ Full summary to work from:
             
             used_message_ids = set()
             for i, topic in enumerate(topics):
-                # Collect message IDs from this topic
-                used_message_ids.update(re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', topic))
-                
-                # Process the topic
-                await self.process_topic(thread, topic, is_first=(i == 0))
+                # Collect message IDs from this topic's attachments
+                topic_used_ids = await self.process_topic(thread, topic, is_first=(i == 0))
+                used_message_ids.update(topic_used_ids)
 
-            # Handle unused attachments
+            # Now process_unused_attachments will only handle truly unused attachments
             await self.process_unused_attachments(thread, used_message_ids)
 
             logger.info(f"Successfully posted summary to {channel.name}")
@@ -739,6 +871,7 @@ Full summary to work from:
             
             active_channels = False
             date_header_posted = False
+            first_message = None  # Store the first message to pin later
             
             # Process categories sequentially
             for category_id in self.category_ids:
@@ -767,7 +900,10 @@ Full summary to work from:
                                 
                                 if "[NOTHING OF NOTE]" not in summary:
                                     if not date_header_posted:
-                                        await self.post_date_header(summary_channel)
+                                        # Post header but don't pin yet
+                                        current_date = datetime.utcnow()
+                                        header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
+                                        first_message = await summary_channel.send(header)
                                         date_header_posted = True
                                     
                                     active_channels = True
@@ -794,9 +930,13 @@ Full summary to work from:
                     logger.debug(traceback.format_exc())
                     continue
             
-            if not active_channels:
+            if active_channels:
+                if first_message:  # first_message was created at the start when date_header_posted became True
+                    jump_message = f"---\n\u200B\n***Click here to jump to the beginning of today's summary: {first_message.jump_url}***"
+                    await summary_channel.send(jump_message)
+            else:
                 await summary_channel.send("No channels had significant activity in the past 24 hours.")
-            
+        
         except Exception as e:
             logger.error(f"Critical error in summary generation: {e}")
             logger.debug(traceback.format_exc())
@@ -815,29 +955,6 @@ Full summary to work from:
             await self.session.close()
         # Call parent's close method
         await super().close()
-
-    async def post_date_header(self, channel):
-        """
-        Posts a date header for the daily summary.
-        
-        Args:
-            channel (discord.TextChannel): The channel to post the header in.
-        """
-        try:
-            current_date = datetime.utcnow()
-            header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
-            await channel.send(header)
-            logger.info(f"Posted date header in {channel.name}")
-        except discord.Forbidden:
-            logger.error(f"No permission to post in channel {channel.name}")
-            raise DiscordError("Cannot post date header - insufficient permissions")
-        except discord.HTTPException as e:
-            logger.error(f"Failed to post date header: {e}")
-            raise DiscordError(f"Failed to post date header: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error posting date header: {e}")
-            logger.debug(traceback.format_exc())
-            raise ChannelSummarizerError(f"Failed to post date header: {e}")
 
     async def safe_send_message(self, channel, content=None, **kwargs):
         """
@@ -946,20 +1063,42 @@ def main():
         
         if args.run_now:
             logger.info("Running summary process immediately...")
-            await bot.generate_summary()
-            logger.info("Summary process completed. Shutting down...")
-            await bot.close()
+            try:
+                await bot.generate_summary()
+                logger.info("Summary process completed. Shutting down...")
+            finally:
+                # Only close sessions and shutdown in immediate mode
+                if bot.session and not bot.session.closed:
+                    await bot.session.close()
+                await bot.close()
         else:
             # Start the scheduler for regular operation
             loop.create_task(schedule_daily_summary(bot))
     
-    # Run the bot
+    # Run the bot with proper cleanup
     try:
         loop.run_until_complete(bot.start(bot_token))
     except KeyboardInterrupt:
-        loop.run_until_complete(bot.close())
-    finally:
-        loop.close()
+        logger.info("Keyboard interrupt received - shutting down...")
+        # Only do full cleanup on keyboard interrupt
+        try:
+            # Cancel all running tasks
+            tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            if tasks:
+                logger.info(f"Cancelling {len(tasks)} pending tasks...")
+                for task in tasks:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            
+            # Close the bot connection
+            if not loop.is_closed():
+                loop.run_until_complete(bot.close())
+        finally:
+            logger.info("Closing event loop...")
+            loop.close()
+    else:
+        # In normal operation, just keep running
+        loop.run_forever()
 
 if __name__ == "__main__":
     main()
