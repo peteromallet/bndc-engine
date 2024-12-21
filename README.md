@@ -58,7 +58,6 @@ CATEGORIES_TO_MONITOR=category_id1,category_id2
 ```bash
 python summary.py
 ```
-
 2. The bot will automatically:
    - Monitor specified categories
    - Generate daily summaries at 10:00 UTC

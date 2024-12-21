@@ -33,3 +33,9 @@ env/
 # Logs
 *.log
 logs/
+
+# db
+*.db
+
+# cache
+cache/
