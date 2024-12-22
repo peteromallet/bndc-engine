@@ -18,6 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.db_handler import DatabaseHandler
 from utils.errors import *
 from utils.error_handler import ErrorHandler, handle_errors
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -291,151 +292,199 @@ class ChannelSummarizer(commands.Bot):
         intents.members = True
         intents.presences = True
 
-        # Add websocket parameters to prevent timeouts
         super().__init__(
             command_prefix="!", 
             intents=intents,
-            heartbeat_timeout=60.0,  # Increase from default 60s
+            heartbeat_timeout=60.0,
             guild_ready_timeout=10.0,
             gateway_queue_size=512
         )
         
-        # Initialize Anthropic client
         self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-        
-        # Create aiohttp session
         self.session = None
 
-        # Get configuration from environment variables
-        categories_str = os.getenv('CATEGORIES_TO_MONITOR')
-        self.category_ids = [int(cat_id) for cat_id in categories_str.split(',')]
         self.summary_channel_id = int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))
-        self.test_summary_channel_id = int(os.getenv('TEST_SUMMARY_CHANNEL_ID'))
         self.guild_id = int(os.getenv('GUILD_ID'))
-        self.is_test_mode = False  # Will be set via command line arg
 
         logger.info("Bot initialized with:")
         logger.info(f"Guild ID: {self.guild_id}")
         logger.info(f"Summary Channel: {self.summary_channel_id}")
-        logger.info(f"Categories to monitor: {len(self.category_ids)} categories")
 
-        # Add this to your existing __init__
         self.rate_limiter = RateLimiter()
 
         self.attachment_handler = AttachmentHandler()
         self.message_formatter = MessageFormatter()
 
-        # Initialize scheduler but don't start it yet
-        self.scheduler = AsyncIOScheduler()
-        self.scheduler.add_job(self.generate_summary, 'cron', hour=11, minute=0, timezone='UTC')
+        self._scheduler = None  # Private variable to track scheduler instance
 
-        # Add after other initializations
         self.db = DatabaseHandler()
 
-        # Add error handler initialization
         self.error_handler = ErrorHandler()
+
+        self.dev_mode = False
+        
+        self.guild_id = None
+        self.summary_channel_id = None
+        self.category_ids = []
+
+    def load_config(self):
+        """Load configuration based on current mode"""
+        try:
+            if self.dev_mode:
+                logger.info("Loading development configuration")
+                self.guild_id = int(os.getenv('DEV_GUILD_ID'))
+                self.summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
+                categories_str = os.getenv('DEV_CATEGORIES_TO_MONITOR')
+                if not categories_str:
+                    raise ConfigurationError("DEV_CATEGORIES_TO_MONITOR not found in environment")
+            else:
+                logger.info("Loading production configuration")
+                self.guild_id = int(os.getenv('GUILD_ID'))
+                self.summary_channel_id = int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))
+                categories_str = os.getenv('CATEGORIES_TO_MONITOR')
+                if not categories_str:
+                    raise ConfigurationError("CATEGORIES_TO_MONITOR not found in environment")
+            
+            self.category_ids = [int(cat_id) for cat_id in categories_str.split(',')]
+            logger.info(f"Configured with guild_id={self.guild_id}, "
+                       f"summary_channel={self.summary_channel_id}, "
+                       f"categories={self.category_ids}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            raise ConfigurationError(f"Failed to load configuration: {e}")
+
+    def load_test_data(self) -> Dict[str, Any]:
+        """Load test data from test.json"""
+        try:
+            with open('test.json', 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load test data: {e}")
+            return {"messages": []}
+
+    @property
+    def scheduler(self):
+        if self._scheduler is None:
+            self._scheduler = AsyncIOScheduler()
+            self._scheduler.add_job(
+                self.generate_summary, 
+                'cron', 
+                hour=11, 
+                minute=0, 
+                timezone='UTC',
+                id='daily_summary'  # Add unique ID to prevent duplicates
+            )
+        return self._scheduler
 
     async def setup_hook(self):
         """This is called when the bot is starting up"""
         try:
             self.session = aiohttp.ClientSession()
-            self.scheduler.start()
+            
+            # Only start scheduler if it's not already running
+            if not self.scheduler.running:
+                self.scheduler.start()
             
             # Set up error handler with notification channel
             notification_channel = self.get_channel(self.summary_channel_id)
-            admin_user = await self.fetch_user(301463647895683072)  # Replace with actual admin user ID
+            admin_user = await self.fetch_user(int(os.getenv('ADMIN_USER_ID')))
             self.error_handler = ErrorHandler(notification_channel, admin_user)
             
         except Exception as e:
             raise ConfigurationError("Failed to initialize bot", e)
 
-    @handle_errors("get_channel_history")
     async def get_channel_history(self, channel_id):
-        """
-        Retrieve message history for a channel with comprehensive error handling.
-        """
-        try:
-            logger.info(f"Attempting to get history for channel {channel_id}")
-            channel = self.get_channel(channel_id)
-            if not channel:
-                raise DiscordError(f"Could not find channel with ID {channel_id}")
-            
-            # Skip channels with 'support' in the name
-            if 'support' in channel.name.lower():
-                logger.info(f"Skipping support channel: {channel.name}")
-                return []
-            
-            yesterday = datetime.utcnow() - timedelta(days=1)
-            messages = []
-            
-            logger.info(f"Fetching messages after {yesterday} for channel {channel.name}")
-            
-            async for message in channel.history(after=yesterday, limit=None):
-                try:
-                    # Add this debug logging for attachments
-                    if message.attachments:
-                        logger.debug(f"Found {len(message.attachments)} attachments in message {message.id}")
-                        # Process each attachment
-                        for attachment in message.attachments:
-                            processed = await self.attachment_handler.process_attachment(
-                                attachment, 
-                                message, 
-                                self.session
-                            )
-                            if processed:
-                                logger.debug(f"Successfully processed attachment {attachment.filename} for message {message.id}")
-                            else:
-                                logger.debug(f"Failed to process attachment {attachment.filename} for message {message.id}")
-
-                    # Count unique reactors instead of total reactions
-                    unique_reactors = set()
-                    for reaction in message.reactions:
-                        async for user in reaction.users():
-                            unique_reactors.add(user.id)
-                    total_unique_reactors = len(unique_reactors)
+        """Get channel history with support for test data channel in dev mode"""
+        if self.dev_mode:
+            try:
+                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
+                logger.info(f"Using test data channel {test_channel_id} for development")
+                
+                test_channel = self.get_channel(test_channel_id)
+                if not test_channel:
+                    raise ChannelSummarizerError(f"Could not access test data channel {test_channel_id}")
+                
+                yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+                messages = []
+                
+                async for message in test_channel.history(after=yesterday, limit=None):
+                    total_reactions = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
                     
-                    # Process message content
-                    content = message.content
-                    if content:
-                        content = '\n'.join(line for line in content.split('\n') 
-                                          if not line.strip().startswith('http'))
+                    # Process attachments
+                    if message.attachments:
+                        async with aiohttp.ClientSession() as session:
+                            for attachment in message.attachments:
+                                processed = await self.attachment_handler.process_attachment(
+                                    attachment, message, session
+                                )
                     
                     messages.append({
-                        'content': content,
+                        'content': message.content,
                         'author': message.author.name,
                         'timestamp': message.created_at,
                         'jump_url': message.jump_url,
-                        'reactions': total_unique_reactors,
-                        'id': str(message.id)
+                        'reactions': total_reactions,
+                        'id': str(message.id),
+                        'attachments': [
+                            {
+                                'url': a.url,
+                                'filename': a.filename,
+                                'content_type': a.content_type
+                            } for a in message.attachments
+                        ]
                     })
-                    
-                except discord.NotFound:
-                    logger.warning(f"Message was deleted while processing: {message.id}")
-                    continue
-                except discord.Forbidden:
-                    logger.error(f"No permission to access message: {message.id}")
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing message {message.id}: {e}")
-                    logger.debug(traceback.format_exc())
-                    continue
+                
+                logger.info(f"Loaded {len(messages)} messages from test data channel")
+                return messages
+                
+            except Exception as e:
+                logger.error(f"Error loading test data channel: {e}")
+                logger.debug(traceback.format_exc())
+                return []
+        
+        # Production code path
+        try:
+            channel = self.get_channel(channel_id)
+            if not channel:
+                raise ChannelSummarizerError(f"Could not access channel {channel_id}")
             
-            logger.info(f"Found {len(messages)} messages in channel {channel.name}")
+            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            messages = []
+            
+            async for message in channel.history(after=yesterday, limit=None):
+                total_reactions = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+                
+                # Process attachments
+                if message.attachments:
+                    async with aiohttp.ClientSession() as session:
+                        for attachment in message.attachments:
+                            processed = await self.attachment_handler.process_attachment(
+                                attachment, message, session
+                            )
+                
+                messages.append({
+                    'content': message.content,
+                    'author': message.author.name,
+                    'timestamp': message.created_at,
+                    'jump_url': message.jump_url,
+                    'reactions': total_reactions,
+                    'id': str(message.id),
+                    'attachments': [
+                        {
+                            'url': a.url,
+                            'filename': a.filename,
+                            'content_type': a.content_type
+                        } for a in message.attachments
+                    ]
+                })
+            
             return messages
             
-        except discord.Forbidden:
-            logger.error(f"Bot lacks permissions to access channel {channel_id}")
-            raise DiscordError("Insufficient permissions to access channel")
-        except discord.NotFound:
-            logger.error(f"Channel {channel_id} not found")
-            raise DiscordError("Channel not found")
-        except discord.HTTPException as e:
-            logger.error(f"Discord API error while accessing channel {channel_id}: {e}")
-            raise DiscordError(f"Discord API error: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error accessing channel {channel_id}: {e}")
+            logger.error(f"Error getting channel history: {e}")
             logger.debug(traceback.format_exc())
-            raise ChannelSummarizerError(f"Unexpected error: {e}")
+            raise
 
     @handle_errors("get_claude_summary")
     async def get_claude_summary(self, messages):
@@ -570,8 +619,7 @@ Required format:
 
 • [Main topic 1]
 • [Main topic 2]
-• [Main topic 3]
-\u200B"
+• [Main topic 3]"
 DO NOT CHANGE THE MESSAGE COUNT LINE. IT MUST BE EXACTLY AS SHOWN ABOVE. DO NOT ADD INCLUDE ELSE IN THE MESSAGE OTHER THAN THE ABOVE.
 
 Full summary to work from:
@@ -605,7 +653,7 @@ Full summary to work from:
                     await asyncio.sleep(5)
                 else:
                     logger.error("All retry attempts failed")
-                    return f"__📨 {message_count} messages sent__\n\n• Error generating summary\n\u200B"
+                    return f"__📨 {message_count} messages sent__\n• Error generating summary\u200B"
                     
             except Exception as e:
                 retry_count += 1
@@ -615,7 +663,7 @@ Full summary to work from:
                     await asyncio.sleep(5)
                 else:
                     logger.error("All retry attempts failed")
-                    return f"__📨 {message_count} messages sent__\n\n• Error generating summary\n\u200B"
+                    return f"__📨 {message_count} messages sent__\n• Error generating summary\u200B"
 
     async def send_initial_message(self, channel, short_summary: str, source_channel_name: str) -> Tuple[discord.Message, Optional[str]]:
         """
@@ -625,8 +673,8 @@ Full summary to work from:
         try:
             source_channel = discord.utils.get(self.get_all_channels(), name=source_channel_name.strip('#'))
             
-            message_content = (f"## <#{source_channel.id}>\n\u200B\n{short_summary}" 
-                             if source_channel else f"## {source_channel_name}\n\u200B\n{short_summary}")
+            message_content = (f"## <#{source_channel.id}>\n{short_summary}" 
+                             if source_channel else f"## {source_channel_name}\n{short_summary}")
             
             # Find the most reacted media file
             top_media = None
@@ -673,31 +721,62 @@ Full summary to work from:
         Returns:
             discord.Thread: The created thread
         """
-        try:
-            if not message:
-                logger.error("Cannot create thread: message is None")
-                raise ValueError("Message cannot be None")
-            
-            logger.info(f"Creating thread for message {message.id}")
-            current_date = datetime.utcnow()
-            thread_name = f"Summary for #{source_channel_name} for {current_date.strftime('%A, %B %d')}"
-            
+        max_retries = 3  # Maximum number of retry attempts
+        for attempt in range(1, max_retries + 1):
             try:
-                thread = await message.create_thread(name=thread_name)
-                logger.info(f"Thread created successfully: {thread.id}")
-                await self.safe_send_message(thread, "──────────────────────────────")
-                return thread
+                if not message:
+                    logger.error("Cannot create thread: message is None")
+                    raise ValueError("Message cannot be None")
+                    
+                logger.info(f"Creating thread for message {message.id}, attempt {attempt}")
+                current_date = datetime.utcnow()
+                
+                # Check if this is the main summary channel
+                is_summary_channel = message.channel.id == self.summary_channel_id
+                
+                if is_summary_channel:
+                    # For main summary channel, use short month format
+                    thread_name = f"Summary for #{source_channel_name} for {current_date.strftime('%A, %B %d')}"
+
+                else:
+                    short_month = current_date.strftime('%b')
+                    thread_name = f"{short_month} - #{source_channel_name} Summary"
+                    # For topic channels, use the original format
+                                    
+                thread = await message.create_thread(
+                    name=thread_name
+                )
+                
+                logger.info(f"Thread created successfully: {thread.id} with name '{thread_name}'")
+                
+                # Send a separator message in the thread
+                await self.safe_send_message(thread, "────────────────────────────")
+                
+                # Store the thread ID in the database
+                self.db.update_summary_thread(message.channel.id, thread.id)
+                logger.info(f"Stored thread ID {thread.id} in database for channel {message.channel.id}")
+                
+                return thread  # Successfully created thread
+                
             except discord.Forbidden as e:
                 logger.error(f"Bot lacks permissions to create thread: {e}")
-                raise DiscordError("Insufficient permissions to create thread")
+                raise DiscordError("Insufficient permissions to create thread") from e
+                
             except discord.HTTPException as e:
-                logger.error(f"Failed to create thread: {e}")
-                raise DiscordError(f"Failed to create thread: {e}")
-            
-        except Exception as e:
-            logger.error(f"Failed to create summary thread: {e}")
-            logger.debug(traceback.format_exc())
-            raise DiscordError(f"Failed to create summary thread: {e}")
+                logger.warning(f"Failed to create thread on attempt {attempt}: {e}")
+                
+                if attempt < max_retries:
+                    retry_delay = 2 ** attempt  # Exponential backoff
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(f"Exceeded max retries ({max_retries}) for creating thread")
+                    raise DiscordError(f"Failed to create thread after {max_retries} attempts") from e
+                
+            except Exception as e:
+                logger.error(f"Unexpected error during thread creation: {e}")
+                logger.debug(traceback.format_exc())
+                raise DiscordError(f"Unexpected error during thread creation: {e}") from e
 
     async def prepare_topic_files(self, topic: str) -> List[Tuple[discord.File, int, str, str]]:
         """
@@ -826,7 +905,7 @@ Full summary to work from:
             logger.debug(traceback.format_exc())
             return set()
     
-    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10):
+    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None):
         """Process and send unused but popular attachments."""
         unused_attachments = []
         
@@ -870,16 +949,67 @@ Full summary to work from:
                 message_content = f"By **{username}**: {message_link}"
                 await self.safe_send_message(thread, message_content, file=file)
 
-        # Optionally post the jump link:
+        # Add links to previous thread and current thread beginning
         try:
-            async for first_message in thread.history(oldest_first=True, limit=1):
-                await self.safe_send_message(
-                    thread,
-                    f"---\n\u200B\n***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
-                )
-                break
+            footer_text = "\n---\n\u200B\n"
+
+            if previous_thread_id and str(previous_thread_id) != str(thread.id):  # Convert to strings for comparison
+                try:
+                    # Add more detailed logging
+                    logger.info(f"Attempting to fetch previous thread {previous_thread_id}")
+                    previous_thread = None
+                    
+                    # Try both fetch_channel and get_channel
+                    try:
+                        previous_thread = self.get_channel(previous_thread_id)
+                        if not previous_thread:
+                            previous_thread = await self.fetch_channel(previous_thread_id)
+                    except discord.NotFound:
+                        logger.warning(f"Could not find thread with ID {previous_thread_id}")
+                    
+                    if previous_thread and isinstance(previous_thread, discord.Thread):
+                        try:
+                            # Get first message of the thread for proper linking
+                            async for first_message in previous_thread.history(oldest_first=True, limit=1):
+                                thread_date = previous_thread.created_at.strftime('%B %Y')
+                                footer_text += (
+                                    f"**You can find a summary of this channel's activity from "
+                                    f"{thread_date} here:** {first_message.jump_url}\n\n"
+                                )
+                                logger.info(f"Successfully added link to previous thread from {thread_date}")
+                                break
+                        except discord.Forbidden:
+                            logger.error(f"Bot lacks permissions to access thread {previous_thread_id}")
+                        except discord.NotFound:
+                            logger.error(f"Thread {previous_thread_id} exists but cannot be accessed")
+                        except Exception as e:
+                            logger.error(f"Error creating previous thread link: {e}")
+                    else:
+                        logger.error(
+                            f"Retrieved channel is not a thread: {type(previous_thread)}"
+                            f" for ID {previous_thread_id}"
+                        )
+                        # Clear invalid thread ID from database
+                        self.db.update_summary_thread(thread.parent.id, None)
+                        logger.info(f"Cleared invalid thread ID {previous_thread_id} from database")
+                except Exception as e:
+                    logger.error(f"Error processing previous thread: {e}")
+                    logger.debug(traceback.format_exc())
+
+            # Add current thread jump link
+            try:
+                async for first_message in thread.history(oldest_first=True, limit=1):
+                    footer_text += f"***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
+                    await self.safe_send_message(thread, footer_text)
+                    logger.info("Successfully added thread navigation links")
+                    break
+            except Exception as e:
+                logger.error(f"Failed to add thread jump link: {e}")
+                logger.debug(traceback.format_exc())
+
         except Exception as e:
-            logger.error(f"Failed to add thread jump link: {e}")
+            logger.error(f"Failed to add thread links: {e}")
+            logger.debug(traceback.format_exc())
 
     async def post_summary(self, channel_id, summary: str, source_channel_name: str, message_count: int):
         try:
@@ -887,6 +1017,62 @@ Full summary to work from:
             if not source_channel:
                 raise DiscordError(f"Could not access source channel {channel_id}")
 
+            logger.info(f"Starting post_summary for channel {source_channel.name} (ID: {channel_id})")
+            
+            # Retrieve existing thread ID from DB before creating a new thread
+            existing_thread_id = self.db.get_summary_thread_id(channel_id)
+            previous_thread_id = existing_thread_id  # Store as previous_thread_id
+            logger.info(f"Retrieved existing thread ID from DB: {existing_thread_id}")
+            
+            source_thread = None
+            thread_existed = False  # Track if thread existed before
+            if existing_thread_id:
+                try:
+                    logger.info(f"Attempting to fetch existing thread with ID: {existing_thread_id}")
+                    source_thread = await self.fetch_channel(existing_thread_id)
+                    if isinstance(source_thread, discord.Thread):
+                        logger.info(f"Successfully fetched existing thread: {source_thread.name}")
+                        thread_existed = True  # Mark that we found an existing thread
+                    else:
+                        logger.error(f"Fetched channel is not a thread: {existing_thread_id}")
+                        source_thread = None
+                        self.db.update_summary_thread(channel_id, None)
+                except discord.NotFound:
+                    logger.error(f"Thread {existing_thread_id} not found")
+                    source_thread = None
+                    logger.info("Updating DB to clear invalid thread ID")
+                    self.db.update_summary_thread(channel_id, None)
+                except Exception as e:
+                    logger.error(f"Failed to fetch existing thread: {e}")
+                    source_thread = None
+                    logger.info("Updating DB to clear invalid thread ID")
+                    self.db.update_summary_thread(channel_id, None)
+
+            # Unpin any previous bot-pinned messages in the channel
+            pins = await source_channel.pins()
+            for pin in pins:
+                if pin.author.id == self.user.id:  # Check if the pin was made by the bot
+                    await pin.unpin()
+
+            if not source_thread:
+                logger.info("Creating new thread for channel")
+                current_date = datetime.utcnow()
+                short_month = current_date.strftime('%b')
+                thread_message = await source_channel.send(
+                    f"📝 A new summary thread has been created for #{source_channel.name} for {datetime.utcnow().strftime('%B %Y')}.\n\n"
+                    "All of the messages in this channel will be summarised here for your convenience:"
+                )
+                await thread_message.pin()  # Pin the new thread message
+                
+                # Use the short month format for the thread name
+                thread_name = f"{short_month} - #{source_channel_name} Summary"
+                source_thread = await thread_message.create_thread(name=thread_name)
+                
+                logger.info(f"Created new thread with ID: {source_thread.id}")
+                self.db.update_summary_thread(channel_id, source_thread.id)  # Update DB after creating thread
+                logger.info(f"Updated DB with new thread ID: {source_thread.id}")
+
+            # Generate short summary and handle main summary channel post
             short_summary = await self.generate_short_summary(summary, message_count)
             
             # Get top attachment for initial message
@@ -903,15 +1089,15 @@ Full summary to work from:
             
             channel_mention = f"<#{source_channel.id}>"
 
-            # First handle main summary thread in summary_channel (all attachments)
-            summary_channel = self.get_channel(self.test_summary_channel_id if self.is_test_mode else self.summary_channel_id)
+            # Remove test mode check and use production channel directly
+            summary_channel = self.get_channel(self.summary_channel_id)
             initial_message = await self.safe_send_message(
                 summary_channel,
-                f"## <#{source_channel.id}>\n\n{short_summary}",
+                f"## <#{source_channel.id}>\n{short_summary}",
                 file=initial_file
             )
 
-            # Create and process main summary thread as before (with all attachments)
+            # Create and process main summary thread
             thread = await self.create_summary_thread(initial_message, source_channel_name)
             topics = summary.split("### ")
             topics = [t.strip().rstrip('#').strip() for t in topics if t.strip()]
@@ -919,31 +1105,9 @@ Full summary to work from:
             for i, topic in enumerate(topics):
                 topic_used_ids = await self.process_topic(thread, topic, is_first=(i == 0))
                 used_message_ids.update(topic_used_ids)
-            await self.process_unused_attachments(thread, used_message_ids)  # Original attachment handling
+            await self.process_unused_attachments(thread, used_message_ids, previous_thread_id=previous_thread_id)
 
-            # ADDITIONALLY handle source channel thread (with limited attachments)
-            existing_thread_id = self.db.get_summary_thread_id(channel_id)
-            source_thread = None
-            if existing_thread_id:
-                try:
-                    source_thread = await source_channel.fetch_thread(existing_thread_id)
-                except:
-                    source_thread = None
-                    self.db.update_summary_thread(channel_id, None)
-
-            # Unpin any previous bot-pinned messages in the channel
-            pins = await source_channel.pins()
-            for pin in pins:
-                if pin.author.id == self.user.id:  # Check if the pin was made by the bot
-                    await pin.unpin()
-
-            if not source_thread:
-                thread_message = await source_channel.send(f"Monthly summary thread for {source_channel.name}")
-                await thread_message.pin()  # Pin the new thread message
-                source_thread = await thread_message.create_thread(name=f"{source_channel.name} - {datetime.utcnow().strftime('%B %Y')} Summary")
-                self.db.update_summary_thread(channel_id, source_thread.id)
-
-            # Post the same summary but with limited attachments at the end
+            # Post to source channel thread (with limited attachments)
             current_date = datetime.utcnow().strftime('%A, %B %d, %Y')
 
             # Create a new file object for the source thread
@@ -962,13 +1126,21 @@ Full summary to work from:
                 file=source_file
             )
 
-            # Process topics exactly the same way
+            # Process topics for source thread
             for i, topic in enumerate(topics):
                 topic_used_ids = await self.process_topic(source_thread, topic, is_first=(i == 0))
                 used_message_ids.update(topic_used_ids)
 
             # Only difference: limit attachments to 3 in the final section
-            await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3)
+            await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3, previous_thread_id=previous_thread_id)
+
+            # After posting the summary to the thread, notify the channel if it was an existing thread
+            if thread_existed:
+                # Build proper Discord deep link using channel and thread IDs
+                thread_link = f"https://discord.com/channels/{self.guild_id}/{source_channel.id}/{source_thread.id}"
+                notification_message = f"📝 A new summary has been added for #{source_channel.name}.\n\nYou can see all of {datetime.utcnow().strftime('%B')}'s activity here: {thread_link}"
+                await self.safe_send_message(source_channel, notification_message)
+                logger.info(f"Posted thread update notification to {source_channel.name}")
 
         except Exception as e:
             logger.error(f"Error in post_summary: {e}")
@@ -980,13 +1152,13 @@ Full summary to work from:
         logger.info("\nStarting summary generation")
         
         try:
-            channel_id = self.test_summary_channel_id if self.is_test_mode else self.summary_channel_id
-            summary_channel = self.get_channel(channel_id)
+            # Remove test mode check and use production channel directly
+            summary_channel = self.get_channel(self.summary_channel_id)
             if not summary_channel:
-                raise DiscordError(f"Could not access summary channel {channel_id}")
+                raise DiscordError(f"Could not access summary channel {self.summary_channel_id}")
             
             logger.info(f"Found summary channel: {summary_channel.name} "
-                       f"({'TEST' if self.is_test_mode else 'PRODUCTION'} mode)")
+                       f"({'DEV' if self.dev_mode else 'PRODUCTION'} mode)")
             
             active_channels = False
             date_header_posted = False
@@ -1039,8 +1211,8 @@ Full summary to work from:
                                     
                                     short_summary = await self.generate_short_summary(summary, len(messages))
                                     
-                                    # Only store in database if NOT in test mode
-                                    if not self.is_test_mode:
+                                    # Only store in database if NOT in dev mode
+                                    if not self.dev_mode:
                                         self.db.store_daily_summary(
                                             channel_id=channel.id,
                                             channel_name=channel.name,
@@ -1050,7 +1222,7 @@ Full summary to work from:
                                         )
                                         logger.info(f"Stored summary in database for {channel.name}")
                                     else:
-                                        logger.info(f"Skipping database storage for {channel.name} (test mode)")
+                                        logger.info(f"Skipping database storage for {channel.name} (dev mode)")
                                     
                                     await self.post_summary(
                                         channel.id,
@@ -1366,7 +1538,7 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Discord Channel Summarizer Bot')
     parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately instead of waiting for scheduled time')
-    parser.add_argument('--test', action='store_true', help='Run in test mode using test channel')
+    parser.add_argument('--dev', action='store_true', help='Run in development mode using test data')
     args = parser.parse_args()
     
     # Load and validate environment variables
@@ -1374,7 +1546,6 @@ def main():
     anthropic_key = os.getenv('ANTHROPIC_API_KEY')
     guild_id = os.getenv('GUILD_ID')
     production_channel_id = os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID')
-    test_channel_id = os.getenv('TEST_SUMMARY_CHANNEL_ID')
     categories_to_monitor = os.getenv('CATEGORIES_TO_MONITOR')
     
     if not bot_token:
@@ -1385,17 +1556,16 @@ def main():
         raise ValueError("Guild ID not found in environment variables")
     if not production_channel_id:
         raise ValueError("Production summary channel ID not found in environment variables")
-    if not test_channel_id:
-        raise ValueError("Test summary channel ID not found in environment variables")
     if not categories_to_monitor:
         raise ValueError("Categories to monitor not found in environment variables")
         
     # Create and run the bot
     bot = ChannelSummarizer()
-    bot.is_test_mode = args.test
+    bot.dev_mode = args.dev
+    bot.load_config()  # Explicitly load config after setting dev_mode
     
-    if args.test:
-        logger.info("Running in TEST mode - summaries will be sent to test channel")
+    if args.dev:
+        logger.info("Running in DEVELOPMENT mode - using test data")
     
     # Create event loop
     loop = asyncio.get_event_loop()

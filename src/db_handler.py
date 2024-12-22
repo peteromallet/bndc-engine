@@ -179,8 +179,13 @@ class DatabaseHandler:
         self.execute_query(query)
 
     def get_summary_thread_id(self, channel_id: int) -> Optional[int]:
-        """Get the summary thread ID for a channel if it exists."""
-        query = "SELECT summary_thread_id FROM channel_summary WHERE channel_id = ?"
+        """Get the summary thread ID for a channel if it exists for the current month."""
+        query = """
+        SELECT summary_thread_id 
+        FROM channel_summary 
+        WHERE channel_id = ? 
+        AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        """
         result = self.execute_query(query, (channel_id,), fetch_one=True)
         return result[0] if result else None
 
