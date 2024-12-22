@@ -326,6 +326,7 @@ class ChannelSummarizer(commands.Bot):
         self.guild_id = None
         self.summary_channel_id = None
         self.category_ids = []
+        self.first_message = None
 
     def load_config(self):
         """Load configuration based on current mode"""
@@ -611,12 +612,10 @@ Please provide the summary now - don't include any other introductory text, endi
    - Give a short summary of one of the main topics from the full summary - priotise topics that are related to the channel and are likely to be useful to others.
    - Bold the most important finding/result/insight using **
    - Keep each to a single line
-3. Then EXACTLY one blank line with only a zero-width space
 4. DO NOT MODIFY THE MESSAGE COUNT OR FORMAT IN ANY WAY
 
 Required format:
 "📨 __{message_count} messages sent__
-
 • [Main topic 1]
 • [Main topic 2]
 • [Main topic 3]"
@@ -838,11 +837,11 @@ Full summary to work from:
             logger.error(f"Failed to send topic chunk: {e}")
             logger.debug(traceback.format_exc())
 
-    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False) -> Set[str]:
-        """Process and send a single topic to the thread."""
+    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False) -> Tuple[Set[str], List[discord.File]]:
+        """Process and send a single topic to the thread. Returns used message IDs and files."""
         try:
             if not topic.strip():
-                return set()
+                return set(), []
 
             # Format topic header
             formatted_topic = ("---\n" if not is_first else "") + f"### {topic}"
@@ -851,6 +850,7 @@ Full summary to work from:
             # Get message IDs from this chunk
             chunk_message_ids = set(re.findall(r'https://discord\.com/channels/\d+/(\d+)/(\d+)', topic))
             used_message_ids = set()
+            used_files = []  # Track files used in this topic
 
             # Prepare files for just this chunk
             chunk_files = []
@@ -872,6 +872,7 @@ Full summary to work from:
                                     message_id,
                                     cache_data['username']
                                 ))
+                                used_files.append(file)  # Track the file
                         except Exception as e:
                             logger.error(f"Failed to prepare file: {e}")
                             continue
@@ -898,29 +899,44 @@ Full summary to work from:
                 # If no attachments, just send the content
                 await self.safe_send_message(thread, formatted_topic)
 
-            return chunk_message_ids
+            return chunk_message_ids, used_files
 
         except Exception as e:
             logger.error(f"Error processing topic: {e}")
             logger.debug(traceback.format_exc())
-            return set()
+            return set(), []
     
-    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None):
+    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None, used_files: List[discord.File] = None):
         """Process and send unused but popular attachments."""
         unused_attachments = []
         
+        # Create set of filenames that were already used
+        used_filenames = {f.filename for f in (used_files or [])}
+        
+        # Get all attachments already in the thread
+        try:
+            async for message in thread.history(limit=None):
+                for attachment in message.attachments:
+                    used_filenames.add(attachment.filename)
+                    logger.debug(f"Adding existing thread attachment to used files: {attachment.filename}")
+        except Exception as e:
+            logger.error(f"Error getting thread history for attachment tracking: {e}")
+        
         for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
-            # cache_key is formatted as "channel_id:message_id"
             channel_part, message_part = cache_key.split(":", 1)
 
-            # Only add attachments if the real message ID wasn't already used
+            # Skip if message was already used or if attachment was used as main image
             if message_part not in used_message_ids and cache_data['reaction_count'] >= 3:
-                # Build a proper Discord link using channel_part and message_part separately
                 message_link = f"https://discord.com/channels/{self.guild_id}/{channel_part}/{message_part}"
 
                 for attachment in cache_data['attachments']:
                     try:
-                        if len(attachment.data) <= 25 * 1024 * 1024:
+                        # Skip if this file was already used anywhere in the thread
+                        if attachment.filename in used_filenames:
+                            logger.debug(f"Skipping already used file: {attachment.filename}")
+                            continue
+                        
+                        if len(attachment.data) <= 25 * 1024 * 1024:  # 25MB limit
                             file = discord.File(
                                 io.BytesIO(attachment.data),
                                 filename=attachment.filename,
@@ -929,7 +945,7 @@ Full summary to work from:
                             unused_attachments.append((
                                 file, 
                                 attachment.reaction_count,
-                                message_part,  # Keep the real message ID
+                                message_part,
                                 attachment.username,
                                 message_link
                             ))
@@ -1040,21 +1056,19 @@ Full summary to work from:
                 except discord.NotFound:
                     logger.error(f"Thread {existing_thread_id} not found")
                     source_thread = None
-                    logger.info("Updating DB to clear invalid thread ID")
                     self.db.update_summary_thread(channel_id, None)
                 except Exception as e:
                     logger.error(f"Failed to fetch existing thread: {e}")
                     source_thread = None
-                    logger.info("Updating DB to clear invalid thread ID")
                     self.db.update_summary_thread(channel_id, None)
 
-            # Unpin any previous bot-pinned messages in the channel
-            pins = await source_channel.pins()
-            for pin in pins:
-                if pin.author.id == self.user.id:  # Check if the pin was made by the bot
-                    await pin.unpin()
-
             if not source_thread:
+                # Only unpin messages when creating a new thread
+                pins = await source_channel.pins()
+                for pin in pins:
+                    if pin.author.id == self.user.id:  # Check if the pin was made by the bot
+                        await pin.unpin()
+                    
                 logger.info("Creating new thread for channel")
                 current_date = datetime.utcnow()
                 short_month = current_date.strftime('%b')
@@ -1064,12 +1078,11 @@ Full summary to work from:
                 )
                 await thread_message.pin()  # Pin the new thread message
                 
-                # Use the short month format for the thread name
                 thread_name = f"{short_month} - #{source_channel_name} Summary"
                 source_thread = await thread_message.create_thread(name=thread_name)
                 
                 logger.info(f"Created new thread with ID: {source_thread.id}")
-                self.db.update_summary_thread(channel_id, source_thread.id)  # Update DB after creating thread
+                self.db.update_summary_thread(channel_id, source_thread.id)
                 logger.info(f"Updated DB with new thread ID: {source_thread.id}")
 
             # Generate short summary and handle main summary channel post
@@ -1097,15 +1110,28 @@ Full summary to work from:
                 file=initial_file
             )
 
+            # Track all files used in any part of the summary
+            used_files = []
+            if initial_file:
+                used_files.append(initial_file)
+
             # Create and process main summary thread
             thread = await self.create_summary_thread(initial_message, source_channel_name)
             topics = summary.split("### ")
             topics = [t.strip().rstrip('#').strip() for t in topics if t.strip()]
             used_message_ids = set()
+            
             for i, topic in enumerate(topics):
-                topic_used_ids = await self.process_topic(thread, topic, is_first=(i == 0))
+                topic_used_ids, topic_files = await self.process_topic(thread, topic, is_first=(i == 0))
                 used_message_ids.update(topic_used_ids)
-            await self.process_unused_attachments(thread, used_message_ids, previous_thread_id=previous_thread_id)
+                used_files.extend(topic_files)  # Track files used in topics
+                
+            await self.process_unused_attachments(
+                thread, 
+                used_message_ids, 
+                previous_thread_id=previous_thread_id,
+                used_files=used_files  # Pass all used files
+            )
 
             # Post to source channel thread (with limited attachments)
             current_date = datetime.utcnow().strftime('%A, %B %d, %Y')
@@ -1128,8 +1154,9 @@ Full summary to work from:
 
             # Process topics for source thread
             for i, topic in enumerate(topics):
-                topic_used_ids = await self.process_topic(source_thread, topic, is_first=(i == 0))
+                topic_used_ids, topic_files = await self.process_topic(source_thread, topic, is_first=(i == 0))
                 used_message_ids.update(topic_used_ids)
+                used_files.extend(topic_files)  # Track files used in topics
 
             # Only difference: limit attachments to 3 in the final section
             await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3, previous_thread_id=previous_thread_id)
@@ -1162,7 +1189,7 @@ Full summary to work from:
             
             active_channels = False
             date_header_posted = False
-            first_message = None
+            self.first_message = None  # Initialize the instance variable
 
             # Process categories sequentially
             for category_id in self.category_ids:
@@ -1205,7 +1232,7 @@ Full summary to work from:
                                     if not date_header_posted:
                                         current_date = datetime.utcnow()
                                         header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
-                                        first_message = await summary_channel.send(header)
+                                        self.first_message = await summary_channel.send(header)
                                         date_header_posted = True
                                         logger.info("Posted date header")
                                     
@@ -1249,6 +1276,17 @@ Full summary to work from:
             if not active_channels:
                 logger.info("No channels had significant activity - sending notification")
                 await summary_channel.send("No channels had significant activity in the past 24 hours.")
+            
+            # Add footer with jump link at the very end
+            if self.first_message:
+                footer_text = f"""---
+
+**_Click here to jump to the top of today's summary:_** {self.first_message.jump_url}"""
+
+                await self.safe_send_message(summary_channel, footer_text)
+                logger.info("Footer message added to summary channel")
+            else:
+                logger.error("first_message is not defined. Cannot add footer.")
             
         except Exception as e:
             logger.error(f"Critical error in summary generation: {e}")
