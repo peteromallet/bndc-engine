@@ -14,7 +14,6 @@ import traceback
 import random
 from typing import List, Tuple, Set, Dict, Optional, Any
 from dataclasses import dataclass
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.db_handler import DatabaseHandler
 from utils.errors import *
 from utils.error_handler import ErrorHandler, handle_errors
@@ -315,8 +314,6 @@ class ChannelSummarizer(commands.Bot):
         self.attachment_handler = AttachmentHandler()
         self.message_formatter = MessageFormatter()
 
-        self._scheduler = None  # Private variable to track scheduler instance
-
         self.db = DatabaseHandler()
 
         self.error_handler = ErrorHandler()
@@ -364,30 +361,11 @@ class ChannelSummarizer(commands.Bot):
             logger.error(f"Failed to load test data: {e}")
             return {"messages": []}
 
-    @property
-    def scheduler(self):
-        if self._scheduler is None:
-            self._scheduler = AsyncIOScheduler()
-            self._scheduler.add_job(
-                self.generate_summary, 
-                'cron', 
-                hour=11, 
-                minute=0, 
-                timezone='UTC',
-                id='daily_summary'  # Add unique ID to prevent duplicates
-            )
-        return self._scheduler
-
     async def setup_hook(self):
         """This is called when the bot is starting up"""
         try:
             self.session = aiohttp.ClientSession()
             
-            # Only start scheduler if it's not already running
-            if not self.scheduler.running:
-                self.scheduler.start()
-            
-            # Set up error handler with notification channel
             notification_channel = self.get_channel(self.summary_channel_id)
             admin_user = await self.fetch_user(int(os.getenv('ADMIN_USER_ID')))
             self.error_handler = ErrorHandler(notification_channel, admin_user)
@@ -749,7 +727,7 @@ Full summary to work from:
                 logger.info(f"Thread created successfully: {thread.id} with name '{thread_name}'")
                 
                 # Send a separator message in the thread
-                await self.safe_send_message(thread, "────────────────────────────")
+                await self.safe_send_message(thread, "## 📝 Detailed Summary")
                 
                 # Store the thread ID in the database
                 self.db.update_summary_thread(message.channel.id, thread.id)
@@ -958,7 +936,7 @@ Full summary to work from:
             unused_attachments.sort(key=lambda x: x[1], reverse=True)
             
             # Post header
-            await self.safe_send_message(thread, "\n\n---\n### 📎 Other Popular Attachments")
+            await self.safe_send_message(thread, "\n\n---\n## 📎 Other Popular Attachments")
             
             # Post each attachment individually with a message link (limited by max_attachments)
             for file, reaction_count, message_id, username, message_link in unused_attachments[:max_attachments]:
@@ -1238,18 +1216,15 @@ Full summary to work from:
                                     
                                     short_summary = await self.generate_short_summary(summary, len(messages))
                                     
-                                    # Only store in database if NOT in dev mode
-                                    if not self.dev_mode:
-                                        self.db.store_daily_summary(
-                                            channel_id=channel.id,
-                                            channel_name=channel.name,
-                                            messages=messages,
-                                            full_summary=summary,
-                                            short_summary=short_summary
-                                        )
-                                        logger.info(f"Stored summary in database for {channel.name}")
-                                    else:
-                                        logger.info(f"Skipping database storage for {channel.name} (dev mode)")
+                                    # Store in database regardless of mode
+                                    self.db.store_daily_summary(
+                                        channel_id=channel.id,
+                                        channel_name=channel.name,
+                                        messages=messages,
+                                        full_summary=summary,
+                                        short_summary=short_summary
+                                    )
+                                    logger.info(f"Stored summary in database for {channel.name}")
                                     
                                     await self.post_summary(
                                         channel.id,
@@ -1551,7 +1526,6 @@ async def schedule_daily_summary(bot):
             
             await bot.generate_summary()
             logger.info(f"Summary generated successfully at {datetime.utcnow()} UTC")
-            
             # Reset failure counter on success
             consecutive_failures = 0
             
