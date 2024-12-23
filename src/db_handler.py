@@ -67,7 +67,8 @@ class DatabaseHandler:
                 'timestamp': msg['timestamp'].isoformat(),
                 'jump_url': msg['jump_url'],
                 'reactions': msg['reactions'],
-                'id': msg['id']
+                'id': msg['id'],
+                'attachments': msg.get('attachments', [])
             } for msg in messages])
             
             query = """
@@ -179,15 +180,32 @@ class DatabaseHandler:
         self.execute_query(query)
 
     def get_summary_thread_id(self, channel_id: int) -> Optional[int]:
-        """Get the summary thread ID for a channel if it exists for the current month."""
-        query = """
-        SELECT summary_thread_id 
-        FROM channel_summary 
-        WHERE channel_id = ? 
-        AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
-        """
-        result = self.execute_query(query, (channel_id,), fetch_one=True)
-        return result[0] if result else None
+        """Get the summary thread ID for a channel if it exists."""
+        try:
+            query = """
+            SELECT summary_thread_id 
+            FROM channel_summary 
+            WHERE channel_id = ?
+            """
+            result = self.execute_query(query, (channel_id,), fetch_one=True)
+            return result[0] if result else None
+        except sqlite3.Error as e:
+            logger.error(f"Database error retrieving summary thread ID: {e}")
+            return None
+
+    def verify_thread_exists(self, thread_id: int) -> bool:
+        """Verify if a thread exists in the database and is valid."""
+        try:
+            query = """
+            SELECT COUNT(*) 
+            FROM channel_summary 
+            WHERE summary_thread_id = ? AND summary_thread_id IS NOT NULL
+            """
+            result = self.execute_query(query, (thread_id,), fetch_one=True)
+            return bool(result[0]) if result else False
+        except sqlite3.Error as e:
+            logger.error(f"Database error verifying thread: {e}")
+            return False
 
     def update_summary_thread(self, channel_id: int, thread_id: Optional[int]):
         """Insert or update the summary thread ID for a channel."""

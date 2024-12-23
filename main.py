@@ -282,6 +282,29 @@ class MessageFormatter:
 
         return chunks
 
+    def chunk_long_content(self, content: str, max_length: int = 1900) -> List[str]:
+        """Split content into chunks that respect Discord's length limits."""
+        chunks = []
+        current_chunk = ""
+        
+        # Split by lines to avoid breaking mid-sentence
+        lines = content.split('\n')
+        
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 <= max_length:
+                current_chunk += line + '\n'
+            else:
+                # If current chunk is not empty, add it to chunks
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = line + '\n'
+        
+        # Add the last chunk if not empty
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
 class ChannelSummarizer(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -322,7 +345,8 @@ class ChannelSummarizer(commands.Bot):
         
         self.guild_id = None
         self.summary_channel_id = None
-        self.category_ids = []
+        self.channels_to_monitor = []
+        self.dev_channels_to_monitor = []
         self.first_message = None
 
     def load_config(self):
@@ -332,21 +356,24 @@ class ChannelSummarizer(commands.Bot):
                 logger.info("Loading development configuration")
                 self.guild_id = int(os.getenv('DEV_GUILD_ID'))
                 self.summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
-                categories_str = os.getenv('DEV_CATEGORIES_TO_MONITOR')
-                if not categories_str:
-                    raise ConfigurationError("DEV_CATEGORIES_TO_MONITOR not found in environment")
+                channels_str = os.getenv('DEV_CHANNELS_TO_MONITOR')
+                if not channels_str:
+                    raise ConfigurationError("DEV_CHANNELS_TO_MONITOR not found in environment")
+                self.dev_channels_to_monitor = [chan.strip() for chan in channels_str.split(',')]
+                logger.info(f"DEV_CHANNELS_TO_MONITOR: {self.dev_channels_to_monitor}")
             else:
                 logger.info("Loading production configuration")
                 self.guild_id = int(os.getenv('GUILD_ID'))
                 self.summary_channel_id = int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))
-                categories_str = os.getenv('CATEGORIES_TO_MONITOR')
-                if not categories_str:
-                    raise ConfigurationError("CATEGORIES_TO_MONITOR not found in environment")
+                channels_str = os.getenv('CHANNELS_TO_MONITOR')
+                if not channels_str:
+                    raise ConfigurationError("CHANNELS_TO_MONITOR not found in environment")
+                self.channels_to_monitor = [int(chan.strip()) for chan in channels_str.split(',')]
+                logger.info(f"CHANNELS_TO_MONITOR: {self.channels_to_monitor}")
             
-            self.category_ids = [int(cat_id) for cat_id in categories_str.split(',')]
             logger.info(f"Configured with guild_id={self.guild_id}, "
-                       f"summary_channel={self.summary_channel_id}, "
-                       f"categories={self.category_ids}")
+                        f"summary_channel={self.summary_channel_id}, "
+                        f"channels={self.channels_to_monitor if not self.dev_mode else self.dev_channels_to_monitor}")
             
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
@@ -422,7 +449,7 @@ class ChannelSummarizer(commands.Bot):
                 logger.debug(traceback.format_exc())
                 return []
         
-        # Production code path
+        # Production and Development Code Path
         try:
             channel = self.get_channel(channel_id)
             if not channel:
@@ -1013,10 +1040,13 @@ Full summary to work from:
 
             logger.info(f"Starting post_summary for channel {source_channel.name} (ID: {channel_id})")
             
-            # Retrieve existing thread ID from DB before creating a new thread
+            # Add debug logging for content lengths
+            logger.debug(f"Summary length: {len(summary)} characters")
+            logger.debug(f"First 500 chars of summary: {summary[:500]}")
+            
+            # Get existing thread ID from DB
             existing_thread_id = self.db.get_summary_thread_id(channel_id)
-            previous_thread_id = existing_thread_id  # Store as previous_thread_id
-            logger.info(f"Retrieved existing thread ID from DB: {existing_thread_id}")
+            logger.debug(f"Existing thread ID: {existing_thread_id}")
             
             source_thread = None
             thread_existed = False  # Track if thread existed before
@@ -1024,9 +1054,18 @@ Full summary to work from:
                 try:
                     logger.info(f"Attempting to fetch existing thread with ID: {existing_thread_id}")
                     source_thread = await self.fetch_channel(existing_thread_id)
+                    
+                    # Add check for orphaned thread
                     if isinstance(source_thread, discord.Thread):
-                        logger.info(f"Successfully fetched existing thread: {source_thread.name}")
-                        thread_existed = True  # Mark that we found an existing thread
+                        try:
+                            # Try to fetch the parent message
+                            parent_message = await source_channel.fetch_message(source_thread.id)
+                            logger.info(f"Successfully fetched existing thread: {source_thread.name}")
+                            thread_existed = True
+                        except discord.NotFound:
+                            logger.warning(f"Parent message for thread {existing_thread_id} was deleted. Creating new thread.")
+                            source_thread = None
+                            self.db.update_summary_thread(channel_id, None)
                     else:
                         logger.error(f"Fetched channel is not a thread: {existing_thread_id}")
                         source_thread = None
@@ -1051,7 +1090,7 @@ Full summary to work from:
                 current_date = datetime.utcnow()
                 short_month = current_date.strftime('%b')
                 thread_message = await source_channel.send(
-                    f"📝 A new summary thread has been created for #{source_channel.name} for {datetime.utcnow().strftime('%B %Y')}.\n\n"
+                    f"📝 A new summary thread has been created for <#{source_channel.id}> for {datetime.utcnow().strftime('%B %Y')}.\n\n"
                     "All of the messages in this channel will be summarised here for your convenience:"
                 )
                 await thread_message.pin()  # Pin the new thread message
@@ -1107,7 +1146,7 @@ Full summary to work from:
             await self.process_unused_attachments(
                 thread, 
                 used_message_ids, 
-                previous_thread_id=previous_thread_id,
+                previous_thread_id=existing_thread_id,
                 used_files=used_files  # Pass all used files
             )
 
@@ -1125,10 +1164,8 @@ Full summary to work from:
             else:
                 source_file = None
 
-            await source_thread.send(
-                f"## Summary from {current_date}\n\n{summary}",
-                file=source_file
-            )
+            # Remove the full summary send and just keep the header
+            await self.safe_send_message(source_thread, f"## Summary from {current_date}")
 
             # Process topics for source thread
             for i, topic in enumerate(topics):
@@ -1137,13 +1174,13 @@ Full summary to work from:
                 used_files.extend(topic_files)  # Track files used in topics
 
             # Only difference: limit attachments to 3 in the final section
-            await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3, previous_thread_id=previous_thread_id)
+            await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3, previous_thread_id=existing_thread_id)
 
             # After posting the summary to the thread, notify the channel if it was an existing thread
             if thread_existed:
                 # Build proper Discord deep link using channel and thread IDs
                 thread_link = f"https://discord.com/channels/{self.guild_id}/{source_channel.id}/{source_thread.id}"
-                notification_message = f"📝 A new summary has been added for #{source_channel.name}.\n\nYou can see all of {datetime.utcnow().strftime('%B')}'s activity here: {thread_link}"
+                notification_message = f"📝 A new daily summary has been added for <#{source_channel.id}>.\n\nYou can see all of {datetime.utcnow().strftime('%B')}'s activity here: {thread_link}"
                 await self.safe_send_message(source_channel, notification_message)
                 logger.info(f"Posted thread update notification to {source_channel.name}")
 
@@ -1169,82 +1206,103 @@ Full summary to work from:
             date_header_posted = False
             self.first_message = None  # Initialize the instance variable
 
-            # Process categories sequentially
-            for category_id in self.category_ids:
-                try:
-                    category = self.get_channel(category_id)
-                    if not category:
-                        logger.error(f"Could not access category {category_id}")
-                        continue
-                    
-                    logger.info(f"\nProcessing category: {category.name}")
-                    
-                    channels = [channel for channel in category.channels 
-                              if isinstance(channel, discord.TextChannel)]
-                    
-                    logger.info(f"Found {len(channels)} channels in category {category.name}")
-                    
-                    if not channels:
-                        logger.warning(f"No text channels found in category {category.name}")
-                        continue
-                    
-                    # Process channels sequentially
-                    for channel in channels:
+            # Process channels based on whether they are categories or specific channels
+            channels_to_process = []
+            if self.dev_mode:
+                if "everyone" in self.dev_channels_to_monitor:
+                    guild = self.get_guild(self.guild_id)
+                    if not guild:
+                        raise DiscordError(f"Could not access guild {self.guild_id}")
+                    channels_to_process = [channel.id for channel in guild.text_channels]
+                    logger.info("Monitoring all text channels in development mode")
+                else:
+                    # Monitor specified channels or categories
+                    for item in self.dev_channels_to_monitor:
                         try:
-                            # Clear attachment cache before processing each channel
-                            self.attachment_handler.clear_cache()
-                            
-                            logger.info(f"Processing channel: {channel.name}")
-                            messages = await self.get_channel_history(channel.id)
-                            
-                            logger.info(f"Channel {channel.name} has {len(messages)} messages")
-                            
-                            if len(messages) >= 20:  # Only process channels with sufficient activity
-                                summary = await self.get_claude_summary(messages)
-                                logger.info(f"Generated summary for {channel.name}: {summary[:100]}...")
-                                
-                                if "[NOTHING OF NOTE]" not in summary:
-                                    logger.info(f"Noteworthy activity found in {channel.name}")
-                                    active_channels = True
-                                    
-                                    if not date_header_posted:
-                                        current_date = datetime.utcnow()
-                                        header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
-                                        self.first_message = await summary_channel.send(header)
-                                        date_header_posted = True
-                                        logger.info("Posted date header")
-                                    
-                                    short_summary = await self.generate_short_summary(summary, len(messages))
-                                    
-                                    # Store in database regardless of mode
-                                    self.db.store_daily_summary(
-                                        channel_id=channel.id,
-                                        channel_name=channel.name,
-                                        messages=messages,
-                                        full_summary=summary,
-                                        short_summary=short_summary
-                                    )
-                                    logger.info(f"Stored summary in database for {channel.name}")
-                                    
-                                    await self.post_summary(
-                                        channel.id,
-                                        summary,
-                                        channel.name,
-                                        len(messages)
-                                    )
-                                    await asyncio.sleep(2)
-                                else:
-                                    logger.info(f"No noteworthy activity in {channel.name}")
+                            item_id = int(item)
+                            channel = self.get_channel(item_id)
+                            if isinstance(channel, discord.CategoryChannel):
+                                # If it's a category, add all text channels within it
+                                logger.info(f"Processing category: {channel.name}")
+                                channels_to_process.extend([c.id for c in channel.channels 
+                                                         if isinstance(c, discord.TextChannel)])
                             else:
-                                logger.warning(f"Skipping {channel.name} - only {len(messages)} messages")
+                                # If it's a regular channel, add it directly
+                                channels_to_process.append(item_id)
+                        except ValueError:
+                            logger.warning(f"Invalid channel/category ID: {item}")
+            else:
+                # Production mode - same logic for handling categories and channels
+                for item in self.channels_to_monitor:
+                    channel = self.get_channel(item)
+                    if isinstance(channel, discord.CategoryChannel):
+                        # If it's a category, add all text channels within it
+                        logger.info(f"Processing category: {channel.name}")
+                        channels_to_process.extend([c.id for c in channel.channels 
+                                                 if isinstance(c, discord.TextChannel)])
+                    else:
+                        # If it's a regular channel, add it directly
+                        channels_to_process.append(item)
+
+            logger.info(f"Final list of channels to process: {channels_to_process}")
+            
+            # Process channels sequentially
+            for channel_id in channels_to_process:
+                try:
+                    # Clear attachment cache before processing each channel
+                    self.attachment_handler.clear_cache()
+                    
+                    channel = self.get_channel(channel_id)
+                    if not channel:
+                        logger.error(f"Could not access channel {channel_id}")
+                        continue
+                    
+                    logger.info(f"Processing channel: {channel.name}")
+                    messages = await self.get_channel_history(channel.id)
+                    
+                    logger.info(f"Channel {channel.name} has {len(messages)} messages")
+                    
+                    if len(messages) >= 20:  # Only process channels with sufficient activity
+                        summary = await self.get_claude_summary(messages)
+                        logger.info(f"Generated summary for {channel.name}: {summary[:100]}...")
+                                
+                        if "[NOTHING OF NOTE]" not in summary:
+                            logger.info(f"Noteworthy activity found in {channel.name}")
+                            active_channels = True
                             
-                        except Exception as e:
-                            logger.error(f"Error processing channel {channel.name}: {e}")
-                            logger.debug(traceback.format_exc())
-                            continue
-                        
+                            if not date_header_posted:
+                                current_date = datetime.utcnow()
+                                header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
+                                self.first_message = await summary_channel.send(header)
+                                date_header_posted = True
+                                logger.info("Posted date header")
+                            
+                            short_summary = await self.generate_short_summary(summary, len(messages))
+                            
+                            # Store in database regardless of mode
+                            self.db.store_daily_summary(
+                                channel_id=channel.id,
+                                channel_name=channel.name,
+                                messages=messages,
+                                full_summary=summary,
+                                short_summary=short_summary
+                            )
+                            logger.info(f"Stored summary in database for {channel.name}")
+                            
+                            await self.post_summary(
+                                channel.id,
+                                summary,
+                                channel.name,
+                                len(messages)
+                            )
+                            await asyncio.sleep(2)
+                        else:
+                            logger.info(f"No noteworthy activity in {channel.name}")
+                    else:
+                        logger.warning(f"Skipping {channel.name} - only {len(messages)} messages")
+                    
                 except Exception as e:
-                    logger.error(f"Error processing category {category_id}: {e}")
+                    logger.error(f"Error processing channel {channel.name}: {e}")
                     logger.debug(traceback.format_exc())
                     continue
             
@@ -1558,7 +1616,7 @@ def main():
     anthropic_key = os.getenv('ANTHROPIC_API_KEY')
     guild_id = os.getenv('GUILD_ID')
     production_channel_id = os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID')
-    categories_to_monitor = os.getenv('CATEGORIES_TO_MONITOR')
+    channels_to_monitor = os.getenv('CHANNELS_TO_MONITOR')
     
     if not bot_token:
         raise ValueError("Discord bot token not found in environment variables")
@@ -1568,8 +1626,8 @@ def main():
         raise ValueError("Guild ID not found in environment variables")
     if not production_channel_id:
         raise ValueError("Production summary channel ID not found in environment variables")
-    if not categories_to_monitor:
-        raise ValueError("Categories to monitor not found in environment variables")
+    if not channels_to_monitor:
+        raise ValueError("Channels to monitor not found in environment variables")
         
     # Create and run the bot
     bot = ChannelSummarizer()

@@ -27,6 +27,7 @@ class ChannelCleaner(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guild_messages = True
+        intents.voice_states = False  # Explicitly disable voice states
         
         super().__init__(command_prefix="!", intents=intents)
         self.db = DatabaseHandler()
@@ -64,7 +65,7 @@ class ChannelCleaner(commands.Bot):
             message_count = 0
             async for message in channel.history(limit=None):
                 message_count += 1
-                if message.author.id == self.user.id and message.type == discord.MessageType.default:
+                if message.author.id == self.user.id:
                     has_deletable_messages = True
                     break
             
@@ -78,7 +79,7 @@ class ChannelCleaner(commands.Bot):
             while True:
                 messages = []
                 async for message in channel.history(limit=None):
-                    if message.author.id == self.user.id and message.type == discord.MessageType.default:
+                    if message.author.id == self.user.id:
                         messages.append(message)
                 
                 if not messages:
@@ -120,38 +121,50 @@ class ChannelCleaner(commands.Bot):
         """Clean a channel and all its threads."""
         total_deleted = 0
         
-        # Clean main channel messages
-        deleted = await self.delete_messages(channel)
-        total_deleted += deleted
+        # If it's a category, process all channels in it
+        if isinstance(channel, discord.CategoryChannel):
+            logger.info(f"Processing category: {channel.name}")
+            for subchannel in channel.channels:
+                deleted = await self.clean_channel_and_threads(subchannel)
+                total_deleted += deleted
+            return total_deleted
         
-        # Clean database entries
-        db_deleted = await self.delete_database_entries(channel.id)
-        if db_deleted:
-            logger.info(f"Deleted database entries for channel #{channel.name}")
-        
-        # Clean all threads in the channel
-        threads = channel.threads
-        logger.info(f"Found {len(threads)} active threads in #{channel.name}")
-        
-        # Get archived threads
-        archived_threads = []
-        async for thread in channel.archived_threads():
-            archived_threads.append(thread)
-        
-        all_threads = threads + archived_threads
-        logger.info(f"Processing {len(all_threads)} total threads in #{channel.name}")
-        
-        for thread in all_threads:
-            try:
-                # Only delete threads created by the bot
-                if thread.owner_id == self.user.id:
-                    await thread.delete()
-                    logger.info(f"Deleted thread: {thread.name} in #{channel.name}")
-                else:
-                    logger.info(f"Skipping thread not owned by bot: {thread.name} in #{channel.name}")
-            except Exception as e:
-                logger.error(f"Could not delete thread {thread.name}: {e}")
+        # For text channels and threads
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            # Clean main channel messages
+            deleted = await self.delete_messages(channel)
+            total_deleted += deleted
             
+            # Clean database entries
+            db_deleted = await self.delete_database_entries(channel.id)
+            if db_deleted:
+                logger.info(f"Deleted database entries for channel #{channel.name}")
+            
+            # Only process threads if it's a text channel (not a thread)
+            if isinstance(channel, discord.TextChannel):
+                # Clean all threads in the channel
+                threads = channel.threads
+                logger.info(f"Found {len(threads)} active threads in #{channel.name}")
+                
+                # Get archived threads
+                archived_threads = []
+                async for thread in channel.archived_threads():
+                    archived_threads.append(thread)
+                
+                all_threads = threads + archived_threads
+                logger.info(f"Processing {len(all_threads)} total threads in #{channel.name}")
+                
+                for thread in all_threads:
+                    try:
+                        # Only delete threads created by the bot
+                        if thread.owner_id == self.user.id:
+                            await thread.delete()
+                            logger.info(f"Deleted thread: {thread.name} in #{channel.name}")
+                        else:
+                            logger.info(f"Skipping thread not owned by bot: {thread.name} in #{channel.name}")
+                    except Exception as e:
+                        logger.error(f"Could not delete thread {thread.name}: {e}")
+        
         return total_deleted
 
     async def close(self):
@@ -163,8 +176,8 @@ async def main():
     # Load environment variables
     load_dotenv()
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
-    dev_categories = os.getenv('DEV_CATEGORIES_TO_MONITOR').split(',')  # Get categories
-    summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))  # Get summary channel
+    dev_channels = os.getenv('DEV_CHANNELS_TO_MONITOR', '').split(',')
+    summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
     
     @bot.event
     async def on_ready():
@@ -180,19 +193,20 @@ async def main():
         else:
             logger.error(f"Could not find summary channel with ID: {summary_channel_id}")
         
-        # Process each category
-        for category_id in dev_categories:
-            category = bot.get_channel(int(category_id))
-            if not category:
-                logger.error(f"Could not find category with ID: {category_id}")
-                continue
+        # Process each channel/category
+        for channel_id in dev_channels:
+            if channel_id:  # Skip empty strings
+                channel = bot.get_channel(int(channel_id))
+                if not channel:
+                    logger.error(f"Could not find channel with ID: {channel_id}")
+                    continue
                 
-            logger.info(f"Processing category: {category.name}")
-            # Process each channel in the category
-            for channel in category.channels:
                 deleted = await bot.clean_channel_and_threads(channel)
                 total_deleted += deleted
-                logger.info(f"Finished cleaning channel #{channel.name}: {deleted} messages deleted")
+                if isinstance(channel, discord.CategoryChannel):
+                    logger.info(f"Finished cleaning category {channel.name}: {deleted} messages deleted")
+                else:
+                    logger.info(f"Finished cleaning channel #{channel.name}: {deleted} messages deleted")
         
         logger.info(f"Total messages deleted: {total_deleted}")
         

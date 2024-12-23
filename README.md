@@ -1,10 +1,10 @@
 # BNDC Engine
 
-A Discord bot that generates comprehensive daily summaries of channel activities using Claude 3.5 Sonnet. The bot monitors specified categories, processes messages, and creates organized summaries with media handling and thread management.
+A Discord bot that generates comprehensive daily summaries of channel activities using Claude 3.5 Sonnet. The bot monitors specified channels and categories, processes messages, and creates organized summaries with media handling and thread management.
 
 ## Features
 
-- 📊 Daily automated summaries at 11:00 UTC
+- 📊 Daily automated summaries at 10:00 UTC
 - 🧵 Creates and maintains summary threads for each channel
 - 📱 Handles images, videos, and other attachments with smart caching
 - ⭐ Tracks reaction counts and highlights popular content
@@ -14,6 +14,8 @@ A Discord bot that generates comprehensive daily summaries of channel activities
 - ⚡ Rate limiting and exponential backoff for API calls
 - 🗄️ Database storage for historical summaries
 - 🛠️ Development mode for testing with sample data
+- 📂 Flexible monitoring of both categories and individual channels
+- 🎯 Smart media handling with collages and video combinations
 
 ## Setup
 
