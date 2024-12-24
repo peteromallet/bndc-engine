@@ -513,7 +513,7 @@ Requirements:
 1. Make sure to ALWAYS include Discord links and external links 
 2. Use Discord's markdown format (not regular markdown)
 3. Use - for top-level points (no bullet for the header itself). Only use - for clear sub-points that directly relate to the point above. You should generally just create a new point for each new topic.
-4. Make each main topic a ### header with an emoji
+4. Make each main topic a ## header with an emoji
 5. Use ** for bold text (especially for usernames and main topics)
 6. Keep it simple - just bullet points and sub-points for each topic, no headers or complex formatting
 7. ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
@@ -521,7 +521,7 @@ Requirements:
 
 Here's one example of what a good summary and topic should look like:
 
-### 🤏 **H264/H265 Compression Techniques for Video Generation Improves Img2Vid**
+## 🤏 **H264/H265 Compression Techniques for Video Generation Improves Img2Vid**
 - **zeevfarbman** recommended h265 compression for frame degradation with less perceptual impact: https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011
 - **johndopamine** suggested using h264 node in MTB node pack for better video generation: https://discord.com/channels/564534534/1316786801247260672
 - Codec compression can help "trick" current workflows/models: https://github.com/tdrussell/codex-pipe
@@ -529,7 +529,7 @@ Here's one example of what a good summary and topic should look like:
 
 And here's another example of a good summary and topic:
 
-### 🏋 **Person Training for Hunyuan Video is Now Possible**    
+## 🏋 **Person Training for Hunyuan Video is Now Possible**    
 - **Kytra** explained that training can be done on relatively modest hardware (24GB VRAM): https://discord.com/channels/1076117621407223829/1316079815446757396/1316418253102383135
 - **TDRussell** provided the repository link: https://github.com/tdrussell/diffusion-pipe
 - Banodocians are generally experimenting with training LoRAs using images and videos
@@ -548,7 +548,7 @@ Remember:
 3. You MUST ALWAYS include the message author's name in bold (**username**) for each point if there's a specific person who did something, said something important, or seemed to be helpful - mention their username, don't tag them. Call them "Banodocians" instead of "users".
 4. You MUST ALWAYS use Discord's markdown format (not regular markdown)
 5. Keep most information at the top bullet level. Only use sub-points for direct supporting details
-6. Make topics clear headers with ###
+6. Make topics clear headers with ##
 
 IMPORTANT: For each bullet point, use the EXACT message URL provided in the data - do not write <message_url> but instead use the actual URL from the message data.
 
@@ -754,7 +754,7 @@ Full summary to work from:
                 logger.info(f"Thread created successfully: {thread.id} with name '{thread_name}'")
                 
                 # Send a separator message in the thread
-                await self.safe_send_message(thread, "## 📝 Detailed Summary")
+                await self.safe_send_message(thread, "# 📝 Detailed Summary")
                 
                 # Store the thread ID in the database
                 self.db.update_summary_thread(message.channel.id, thread.id)
@@ -849,7 +849,7 @@ Full summary to work from:
                 return set(), []
 
             # Format topic header
-            formatted_topic = ("---\n" if not is_first else "") + f"### {topic}"
+            formatted_topic = ("---\n" if not is_first else "") + f"## {topic}"
             logger.info(f"Processing topic: {formatted_topic[:100]}...")
 
             # Get message IDs from this chunk
@@ -963,7 +963,7 @@ Full summary to work from:
             unused_attachments.sort(key=lambda x: x[1], reverse=True)
             
             # Post header
-            await self.safe_send_message(thread, "\n\n---\n## 📎 Other Popular Attachments")
+            await self.safe_send_message(thread, "\n\n---\n# 📎 Other Popular Attachments")
             
             # Post each attachment individually with a message link (limited by max_attachments)
             for file, reaction_count, message_id, username, message_link in unused_attachments[:max_attachments]:
@@ -1134,7 +1134,7 @@ Full summary to work from:
 
             # Create and process main summary thread
             thread = await self.create_summary_thread(initial_message, source_channel_name)
-            topics = summary.split("### ")
+            topics = summary.split("## ")
             topics = [t.strip().rstrip('#').strip() for t in topics if t.strip()]
             used_message_ids = set()
             
@@ -1213,8 +1213,10 @@ Full summary to work from:
                     guild = self.get_guild(self.guild_id)
                     if not guild:
                         raise DiscordError(f"Could not access guild {self.guild_id}")
-                    channels_to_process = [channel.id for channel in guild.text_channels]
-                    logger.info("Monitoring all text channels in development mode")
+                    
+                    # Exclude channels with "support" in their name
+                    channels_to_process = [channel.id for channel in guild.text_channels if 'support' not in channel.name.lower()]
+                    logger.info("Monitoring all text channels in development mode, excluding support channels")
                 else:
                     # Monitor specified channels or categories
                     for item in self.dev_channels_to_monitor:
@@ -1222,13 +1224,16 @@ Full summary to work from:
                             item_id = int(item)
                             channel = self.get_channel(item_id)
                             if isinstance(channel, discord.CategoryChannel):
-                                # If it's a category, add all text channels within it
+                                # If it's a category, add all text channels within it, excluding support channels
                                 logger.info(f"Processing category: {channel.name}")
-                                channels_to_process.extend([c.id for c in channel.channels 
-                                                         if isinstance(c, discord.TextChannel)])
+                                channels_to_process.extend([
+                                    c.id for c in channel.channels 
+                                    if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
+                                ])
                             else:
-                                # If it's a regular channel, add it directly
-                                channels_to_process.append(item_id)
+                                # If it's a regular channel, add it if it doesn't have "support" in its name
+                                if 'support' not in channel.name.lower():
+                                    channels_to_process.append(item_id)
                         except ValueError:
                             logger.warning(f"Invalid channel/category ID: {item}")
             else:
@@ -1236,14 +1241,17 @@ Full summary to work from:
                 for item in self.channels_to_monitor:
                     channel = self.get_channel(item)
                     if isinstance(channel, discord.CategoryChannel):
-                        # If it's a category, add all text channels within it
+                        # If it's a category, add all text channels within it, excluding support channels
                         logger.info(f"Processing category: {channel.name}")
-                        channels_to_process.extend([c.id for c in channel.channels 
-                                                 if isinstance(c, discord.TextChannel)])
+                        channels_to_process.extend([
+                            c.id for c in channel.channels 
+                            if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
+                        ])
                     else:
-                        # If it's a regular channel, add it directly
-                        channels_to_process.append(item)
-
+                        # If it's a regular channel, add it if it doesn't have "support" in its name
+                        if 'support' not in channel.name.lower():
+                            channels_to_process.append(item)
+            
             logger.info(f"Final list of channels to process: {channels_to_process}")
             
             # Process channels sequentially
