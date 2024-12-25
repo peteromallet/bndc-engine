@@ -12,7 +12,7 @@ import re
 import logging
 import traceback
 import random
-from typing import List, Tuple, Set, Dict, Optional, Any
+from typing import List, Tuple, Set, Dict, Optional, Any, Union
 from dataclasses import dataclass
 from src.db_handler import DatabaseHandler
 from utils.errors import *
@@ -20,6 +20,7 @@ from utils.error_handler import ErrorHandler, handle_errors
 import json
 from logging.handlers import RotatingFileHandler
 from utils.log_handler import LogHandler
+import sys
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -322,6 +323,9 @@ class ChannelSummarizer(commands.Bot):
         self.channels_to_monitor = []
         self.dev_channels_to_monitor = []
         self.first_message = None
+        self._summary_lock = asyncio.Lock()
+        self._shutdown_flag = False
+        self.current_summary_attachments = []
 
     def setup_logger(self, dev_mode):
         """Initialize or update logger configuration"""
@@ -387,14 +391,39 @@ class ChannelSummarizer(commands.Bot):
             self.logger.error(f"Failed to load configuration: {e}")  # Changed
             raise ConfigurationError(f"Failed to load configuration: {e}")
 
-    def load_test_data(self) -> Dict[str, Any]:
+    def load_test_data(self) -> List[Dict[str, Any]]:
         """Load test data from test.json"""
         try:
-            with open('test.json', 'r') as f:
-                return json.load(f)
+            # Use an absolute path relative to the script location
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            test_data_path = os.path.join(script_dir, 'test.json')
+            
+            if not os.path.exists(test_data_path):
+                # Create default test data if file doesn't exist
+                test_data = {
+                    "messages": [
+                        {
+                            "content": "Test message 1",
+                            "author": "test_user",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "attachments": [],
+                            "reactions": 0,
+                            "id": "1234567890"
+                        }
+                    ]
+                }
+                with open(test_data_path, 'w') as f:
+                    json.dump(test_data, f, indent=2)
+                self.logger.info(f"Created default test data at {test_data_path}")
+                return test_data["messages"]
+                
+            with open(test_data_path, 'r') as f:
+                data = json.load(f)
+                return data.get("messages", [])
+                
         except Exception as e:
             self.logger.error(f"Failed to load test data: {e}")
-            return {"messages": []}
+            return []
 
     async def setup_hook(self):
         """This is called when the bot is starting up"""
@@ -408,87 +437,25 @@ class ChannelSummarizer(commands.Bot):
         except Exception as e:
             raise ConfigurationError("Failed to initialize bot", e)
 
-    async def get_channel_history(self, channel_id):
-        """Get channel history with support for test data channel in dev mode"""
+    async def get_channel_history(self, channel_id: int) -> List[Union[discord.Message, dict]]:
+        """Get message history for a channel, using test data channel in dev mode"""
         if self.dev_mode:
-            try:
-                # Remove excessive environment logging
-                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
-                test_channel = self.get_channel(test_channel_id)
-                
-                if not test_channel:
-                    self.logger.error(f"Could not find channel with ID {test_channel_id}")
-                    return []
-                
-                yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-                # Add detailed environment logging
-                self.logger.debug("Environment state in get_channel_history:")
-                self.logger.debug("All environment variables containing 'CHANNEL':")
-                for key, value in os.environ.items():
-                    if 'CHANNEL' in key:
-                        self.logger.debug(f"{key}: {value}")
-                
-                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
-                self.logger.debug(f"TEST_DATA_CHANNEL before conversion: {os.getenv('TEST_DATA_CHANNEL')}")
-                self.logger.debug(f"TEST_DATA_CHANNEL after conversion: {test_channel_id}")
-                
-                test_channel = self.get_channel(test_channel_id)
-                if test_channel:
-                    self.logger.debug(f"Found test channel: {test_channel.name} ({test_channel.id})")
-                else:
-                    self.logger.error(f"Could not find channel with ID {test_channel_id}")
-                
-                yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-                messages = []
-                
-                async for message in test_channel.history(after=yesterday, limit=None):
-                    total_reactions = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
-                    
-                    # Process attachments - store with the test channel ID
-                    if message.attachments:
-                        async with aiohttp.ClientSession() as session:
-                            for attachment in message.attachments:
-                                processed = await self.attachment_handler.process_attachment(
-                                    attachment, 
-                                    message, 
-                                    session
-                                )
-                    
-                    messages.append({
-                        'content': message.content,
-                        'author': message.author.name,
-                        'timestamp': message.created_at,
-                        'jump_url': message.jump_url,
-                        'reactions': total_reactions,
-                        'id': str(message.id),
-                        'attachments': [
-                            {
-                                'url': a.url,
-                                'filename': a.filename,
-                                'content_type': a.content_type
-                            } for a in message.attachments
-                        ]
-                    })
-                
-                self.logger.info(f"Loaded {len(messages)} messages from test data channel")
-                return messages
-                
-            except Exception as e:
-                self.logger.error(f"Error loading test data channel: {e}")
-                self.logger.debug(traceback.format_exc())
+            test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
+            self.logger.debug(f"TEST_DATA_CHANNEL: {test_channel_id}")
+            
+            # Get the actual test channel
+            test_channel = self.get_channel(test_channel_id)
+            if not test_channel:
+                self.logger.error(f"Could not find test channel {test_channel_id}")
                 return []
-        
-        # Production and Development Code Path
-        try:
-            channel = self.get_channel(channel_id)
-            if not channel:
-                raise ChannelSummarizerError(f"Could not access channel {channel_id}")
             
-            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            # Get real messages from the test channel
             messages = []
-            
-            async for message in channel.history(after=yesterday, limit=None):
-                total_reactions = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+            async for message in test_channel.history(
+                limit=100,
+                after=datetime.utcnow() - timedelta(days=1)
+            ):
+                messages.append(message)
                 
                 # Process attachments
                 if message.attachments:
@@ -497,29 +464,23 @@ class ChannelSummarizer(commands.Bot):
                             processed = await self.attachment_handler.process_attachment(
                                 attachment, message, session
                             )
-                
-                messages.append({
-                    'content': message.content,
-                    'author': message.author.name,
-                    'timestamp': message.created_at,
-                    'jump_url': message.jump_url,
-                    'reactions': total_reactions,
-                    'id': str(message.id),
-                    'attachments': [
-                        {
-                            'url': a.url,
-                            'filename': a.filename,
-                            'content_type': a.content_type
-                        } for a in message.attachments
-                    ]
-                })
+            
+            self.logger.info(f"Loaded {len(messages)} messages from test data channel")
+            return messages
+        
+        else:
+            channel = self.get_channel(channel_id)
+            if not channel:
+                raise DiscordError(f"Could not access channel {channel_id}")
+            
+            messages = []
+            async for message in channel.history(
+                limit=100,
+                after=datetime.utcnow() - timedelta(days=1)
+            ):
+                messages.append(message)
             
             return messages
-            
-        except Exception as e:
-            self.logger.error(f"Error getting channel history: {e}")
-            self.logger.debug(traceback.format_exc())
-            raise
 
     @handle_errors("get_claude_summary")
     async def get_claude_summary(self, messages):
@@ -584,10 +545,16 @@ IMPORTANT: For each bullet point, use the EXACT message URL provided in the data
 Please provide the summary now - don't include any other introductory text, ending text, or explanation of the summary:\n\n"""
         
             for msg in messages:
-                conversation += f"{msg['timestamp']} - {msg['author']}: {msg['content']}"
-                if msg['reactions']:
-                    conversation += f"\nReactions: {msg['reactions']}"
-                conversation += f"\nDiscord link: {msg['jump_url']}\n\n"
+                timestamp = msg.created_at
+                author = msg.author.name
+                content = msg.content
+                reactions = sum(reaction.count for reaction in msg.reactions) if msg.reactions else 0
+                jump_url = msg.jump_url
+
+                conversation += f"{timestamp} - {author}: {content}"
+                if reactions:
+                    conversation += f"\nReactions: {reactions}"
+                conversation += f"\nDiscord link: {jump_url}\n\n"
 
             loop = asyncio.get_running_loop()
             
@@ -837,7 +804,7 @@ Full summary to work from:
             # Get message IDs from this chunk
             chunk_message_ids = set(re.findall(r'https://discord\.com/channels/\d+/(\d+)/(\d+)', topic))
             used_message_ids = set()
-            used_files = []  # Track files used in this topic
+            used_files_in_topic = set()  # Track files by filename within this topic only
 
             # Prepare files for just this chunk
             chunk_files = []
@@ -847,6 +814,10 @@ Full summary to work from:
                     cache_data = self.attachment_handler.attachment_cache[cache_key]
                     for attachment in cache_data['attachments']:
                         try:
+                            # Only skip if this exact file was already used in this topic
+                            if attachment.filename in used_files_in_topic:
+                                continue
+                            
                             if len(attachment.data) <= 25 * 1024 * 1024:  # 25MB limit
                                 file = discord.File(
                                     io.BytesIO(attachment.data),
@@ -859,7 +830,7 @@ Full summary to work from:
                                     message_id,
                                     cache_data['username']
                                 ))
-                                used_files.append(file)  # Track the file
+                                used_files_in_topic.add(attachment.filename)  # Track only within topic
                         except Exception as e:
                             self.logger.error(f"Failed to prepare file: {e}")
                             continue
@@ -867,6 +838,8 @@ Full summary to work from:
             # Sort files by reaction count and limit to top 10
             chunk_files.sort(key=lambda x: x[1], reverse=True)
             chunk_files = chunk_files[:10]
+
+            # Rest of the method remains the same...
 
             # Send the chunk with its specific attachments
             if chunk_files:
@@ -886,19 +859,19 @@ Full summary to work from:
                 # If no attachments, just send the content
                 await self.safe_send_message(thread, formatted_topic)
 
-            return chunk_message_ids, used_files
+            return chunk_message_ids, used_files_in_topic
 
         except Exception as e:
             self.logger.error(f"Error processing topic: {e}")
             self.logger.debug(traceback.format_exc())
             return set(), []
     
-    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None, used_files: List[discord.File] = None):
+    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None, used_files: Set[str] = None):
         """Process and send unused but popular attachments."""
         unused_attachments = []
         
-        # Create set of filenames that were already used
-        used_filenames = {f.filename for f in (used_files or [])}
+        # used_files is now a set of filenames
+        used_filenames = used_files or set()
         
         # Get all attachments already in the thread
         try:
@@ -1175,167 +1148,180 @@ Full summary to work from:
             raise
 
     async def generate_summary(self):
-        self.logger.info("generate_summary started")
-        self.logger.info("\nStarting summary generation")
-        
-        try:
-            # Remove test mode check and use production channel directly
-            summary_channel = self.get_channel(self.summary_channel_id)
-            if not summary_channel:
-                raise DiscordError(f"Could not access summary channel {self.summary_channel_id}")
+        if self._summary_lock.locked():
+            self.logger.warning("Summary generation already in progress, skipping...")
+            return
             
-            self.logger.info(f"Found summary channel: {summary_channel.name} "
-                       f"({'DEV' if self.dev_mode else 'PRODUCTION'} mode)")
+        async with self._summary_lock:
+            self.logger.info("generate_summary started")
+            self.logger.info("\nStarting summary generation")
             
-            active_channels = False
-            date_header_posted = False
-            self.first_message = None
+            try:
+                self.current_summary_attachments = []  # Reset for new summary
+                self.attachment_handler.clear_cache()  # Clear at start
+                
+                # Remove test mode check and use production channel directly
+                summary_channel = self.get_channel(self.summary_channel_id)
+                if not summary_channel:
+                    raise DiscordError(f"Could not access summary channel {self.summary_channel_id}")
+                
+                self.logger.info(f"Found summary channel: {summary_channel.name} "
+                           f"({'DEV' if self.dev_mode else 'PRODUCTION'} mode)")
+                
+                active_channels = False
+                date_header_posted = False
+                self.first_message = None
 
-            # Process channels based on whether they are categories or specific channels
-            channels_to_process = []
-            if self.dev_mode:
-                if "everyone" in self.dev_channels_to_monitor:
-                    guild = self.get_guild(self.guild_id)
-                    if not guild:
-                        raise DiscordError(f"Could not access guild {self.guild_id}")
-                    
-                    # Only exclude support channels
-                    channels_to_process = [channel.id for channel in guild.text_channels 
-                                         if 'support' not in channel.name.lower()]
-                else:
-                    # Monitor specified channels or categories
-                    for item in self.dev_channels_to_monitor:
-                        try:
-                            item_id = int(item)
-                            channel = self.get_channel(item_id)
-                            if isinstance(channel, discord.CategoryChannel):
-                                # If it's a category, add all text channels within it, excluding support channels
-                                self.logger.info(f"Processing category: {channel.name}")
-                                channels_to_process.extend([
-                                    c.id for c in channel.channels 
-                                    if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
-                                ])
-                            else:
-                                # If it's a regular channel, add it if it doesn't have "support" in its name
-                                if 'support' not in channel.name.lower():
-                                    channels_to_process.append(item_id)
-                        except ValueError:
-                            self.logger.warning(f"Invalid channel/category ID: {item}")
-            else:
-                # Production mode - same logic for handling categories and channels
-                for item in self.channels_to_monitor:
-                    channel = self.get_channel(item)
-                    if isinstance(channel, discord.CategoryChannel):
-                        # If it's a category, add all text channels within it, excluding support channels
-                        self.logger.info(f"Processing category: {channel.name}")
-                        channels_to_process.extend([
-                            c.id for c in channel.channels 
-                            if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
-                        ])
-                    else:
-                        # If it's a regular channel, add it if it doesn't have "support" in its name
-                        if 'support' not in channel.name.lower():
-                            channels_to_process.append(item)
-            
-            self.logger.info(f"Final list of channels to process: {channels_to_process}")
-            
-            # Process channels sequentially
-            for channel_id in channels_to_process:
-                try:
-                    # Clear attachment cache before processing each channel
-                    self.attachment_handler.clear_cache()
-                    
-                    channel = self.get_channel(channel_id)
-                    if not channel:
-                        self.logger.error(f"Could not access channel {channel_id}")
-                        continue
-                    
-                    self.logger.info(f"Processing channel: {channel.name}")
-                    messages = await self.get_channel_history(channel.id)
-                    
-                    self.logger.info(f"Channel {channel.name} has {len(messages)} messages")
-                    
-                    # Process messages for caching attachments regardless of channel type
-                    if len(messages) >= 10:
-                        # For gens channels, just process attachments without creating summary
-                        if 'gens' in channel.name.lower():
-                            self.logger.info(f"Processing attachments for gens channel: {channel.name}")
-                            continue  # Skip to next channel after attachments are cached
+                # Process channels based on whether they are categories or specific channels
+                channels_to_process = []
+                if self.dev_mode:
+                    if "everyone" in self.dev_channels_to_monitor:
+                        guild = self.get_guild(self.guild_id)
+                        if not guild:
+                            raise DiscordError(f"Could not access guild {self.guild_id}")
                         
-                        # For non-gens channels, generate summary
-                        summary = await self.get_claude_summary(messages)
-                        self.logger.info(f"Generated summary for {channel.name}: {summary[:100]}...")
-                                
-                        if "[NOTHING OF NOTE]" not in summary:
-                            self.logger.info(f"Noteworthy activity found in {channel.name}")
-                            active_channels = True
-                            
-                            if not date_header_posted:
-                                current_date = datetime.utcnow()
-                                header = f"# 📅 Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
-                                self.first_message = await summary_channel.send(header)
-                                date_header_posted = True
-                                self.logger.info("Posted date header")
-                            
-                            short_summary = await self.generate_short_summary(summary, len(messages))
-                            
-                            # Store in database regardless of mode
-                            self.db.store_daily_summary(
-                                channel_id=channel.id,
-                                channel_name=channel.name,
-                                messages=messages,
-                                full_summary=summary,
-                                short_summary=short_summary
-                            )
-                            self.logger.info(f"Stored summary in database for {channel.name}")
-                            
-                            await self.post_summary(
-                                channel.id,
-                                summary,
-                                channel.name,
-                                len(messages)
-                            )
-                            await asyncio.sleep(2)
-                        else:
-                            self.logger.info(f"No noteworthy activity in {channel.name}")
+                        # Only exclude support channels
+                        channels_to_process = [channel.id for channel in guild.text_channels 
+                                             if 'support' not in channel.name.lower()]
                     else:
-                        self.logger.warning(f"Skipping {channel.name} - only {len(messages)} messages")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing channel {channel.name}: {e}")
-                    self.logger.debug(traceback.format_exc())
-                    continue
-            
-            if not active_channels:
-                self.logger.info("No channels had significant activity - sending notification")
-                await summary_channel.send("No channels had significant activity in the past 24 hours.")
-            else:
-                # Create top generations thread after all channels are processed
-                self.logger.info("Active channels found, attempting to create top generations thread")
-                try:
-                    await self.create_top_generations_thread(summary_channel)
-                    self.logger.info("Top generations thread creation completed")
-                except Exception as e:
-                    self.logger.error(f"Failed to create top generations thread: {e}")
-                    self.logger.debug(traceback.format_exc())
-                    # Don't raise here to allow the rest of the summary to complete
+                        # Monitor specified channels or categories
+                        for item in self.dev_channels_to_monitor:
+                            try:
+                                item_id = int(item)
+                                channel = self.get_channel(item_id)
+                                if isinstance(channel, discord.CategoryChannel):
+                                    # If it's a category, add all text channels within it, excluding support channels
+                                    self.logger.info(f"Processing category: {channel.name}")
+                                    channels_to_process.extend([
+                                        c.id for c in channel.channels 
+                                        if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
+                                    ])
+                                else:
+                                    # If it's a regular channel, add it if it doesn't have "support" in its name
+                                    if 'support' not in channel.name.lower():
+                                        channels_to_process.append(item_id)
+                            except ValueError:
+                                self.logger.warning(f"Invalid channel/category ID: {item}")
+                else:
+                    # Production mode - same logic for handling categories and channels
+                    for item in self.channels_to_monitor:
+                        channel = self.get_channel(item)
+                        if isinstance(channel, discord.CategoryChannel):
+                            # If it's a category, add all text channels within it, excluding support channels
+                            self.logger.info(f"Processing category: {channel.name}")
+                            channels_to_process.extend([
+                                c.id for c in channel.channels 
+                                if isinstance(c, discord.TextChannel) and 'support' not in c.name.lower()
+                            ])
+                        else:
+                            # If it's a regular channel, add it if it doesn't have "support" in its name
+                            if 'support' not in channel.name.lower():
+                                channels_to_process.append(item)
+                
+                self.logger.info(f"Final list of channels to process: {channels_to_process}")
+                
+                # Process channels sequentially
+                for channel_id in channels_to_process:
+                    try:
+                        channel = self.get_channel(channel_id)
+                        if not channel:
+                            self.logger.error(f"Could not access channel {channel_id}")
+                            continue
+                        
+                        self.logger.info(f"Processing channel: {channel.name}")
+                        messages = await self.get_channel_history(channel.id)
+                        
+                        # Store attachments from this channel
+                        for message in messages:
+                            if message.attachments:
+                                self.current_summary_attachments.append({
+                                    'message': message,
+                                    'channel': channel,
+                                    'attachments': message.attachments,
+                                    'reaction_count': sum(r.count for r in message.reactions) if message.reactions else 0
+                                })
+                        
+                        # Process messages for caching attachments regardless of channel type
+                        if len(messages) >= 10:
+                            # For gens channels, just process attachments without creating summary
+                            if 'gens' in channel.name.lower():
+                                self.logger.info(f"Processing attachments for gens channel: {channel.name}")
+                                continue  # Skip to next channel after attachments are cached
+                            
+                            # For non-gens channels, generate summary
+                            summary = await self.get_claude_summary(messages)
+                            self.logger.info(f"Generated summary for {channel.name}: {summary[:100]}...")
+                                    
+                            if "[NOTHING OF NOTE]" not in summary:
+                                self.logger.info(f"Noteworthy activity found in {channel.name}")
+                                active_channels = True
+                                
+                                if not date_header_posted:
+                                    current_date = datetime.utcnow()
+                                    header = f"#  Daily Summary for {current_date.strftime('%A, %B %d, %Y')}"
+                                    self.first_message = await summary_channel.send(header)
+                                    date_header_posted = True
+                                    self.logger.info("Posted date header")
+                                
+                                short_summary = await self.generate_short_summary(summary, len(messages))
+                                
+                                # Store in database regardless of mode
+                                self.db.store_daily_summary(
+                                    channel_id=channel.id,
+                                    channel_name=channel.name,
+                                    messages=messages,
+                                    full_summary=summary,
+                                    short_summary=short_summary
+                                )
+                                self.logger.info(f"Stored summary in database for {channel.name}")
+                                
+                                await self.post_summary(
+                                    channel.id,
+                                    summary,
+                                    channel.name,
+                                    len(messages)
+                                )
+                                await asyncio.sleep(2)
+                            else:
+                                self.logger.info(f"No noteworthy activity in {channel.name}")
+                        else:
+                            self.logger.warning(f"Skipping {channel.name} - only {len(messages)} messages")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing channel {channel.name}: {e}")
+                        self.logger.debug(traceback.format_exc())
+                        continue
+                
+                if not active_channels:
+                    self.logger.info("No channels had significant activity - sending notification")
+                    await summary_channel.send("No channels had significant activity in the past 24 hours.")
+                else:
+                    # Create top generations thread after all channels are processed
+                    self.logger.info("Active channels found, attempting to create top generations thread")
+                    try:
+                        await self.create_top_generations_thread(summary_channel)
+                        self.logger.info("Top generations thread creation completed")
+                    except Exception as e:
+                        self.logger.error(f"Failed to create top generations thread: {e}")
+                        self.logger.debug(traceback.format_exc())
+                        # Don't raise here to allow the rest of the summary to complete
 
-            # Add footer with jump link at the very end
-            if self.first_message:
-                footer_text = f"""---
+                # Add footer with jump link at the very end
+                if self.first_message:
+                    footer_text = f"""---
 
 **_Click here to jump to the top of today's summary:_** {self.first_message.jump_url}"""
 
-                await self.safe_send_message(summary_channel, footer_text)
-                self.logger.info("Footer message added to summary channel")
-            else:
-                self.logger.error("first_message is not defined. Cannot add footer.")
-            
-        except Exception as e:
-            self.logger.error(f"Critical error in summary generation: {e}")
-            self.logger.debug(traceback.format_exc())
-            raise
-        self.logger.info("generate_summary completed")
+                    await self.safe_send_message(summary_channel, footer_text)
+                    self.logger.info("Footer message added to summary channel")
+                else:
+                    self.logger.error("first_message is not defined. Cannot add footer.")
+                
+            except Exception as e:
+                self.logger.error(f"Critical error in summary generation: {e}")
+                self.logger.debug(traceback.format_exc())
+                raise
+            self.logger.info("generate_summary completed")
 
     async def on_ready(self):
         self.logger.info(f"Logged in as {self.user}")
@@ -1488,54 +1474,79 @@ Full summary to work from:
         try:
             self.logger.info("Starting create_top_generations_thread")
             
-            # In dev mode, use the test data channel
+            # Get the correct channel to monitor in dev mode
             if self.dev_mode:
-                test_channel_id = str(os.getenv('TEST_DATA_CHANNEL'))
-                self.logger.info(f"Using test data channel {test_channel_id} for development")  # Changed from logger to self.logger
-                monitored_channels = [test_channel_id]
+                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
+                self.logger.info(f"Using test data channel {test_channel_id} for development")
+                monitored_channels = [test_channel_id]  # Only monitor test channel in dev mode
             else:
-                # Production mode - use ALL channels
-                guild = self.get_guild(self.guild_id)
-                if not guild:
-                    raise DiscordError(f"Could not access guild {self.guild_id}")
-                
-                # Include all channels except support
-                monitored_channels = [
-                    str(channel.id) for channel in guild.text_channels 
-                    if 'support' not in channel.name.lower()
-                ]
+                monitored_channels = [int(chan) for chan in self.channels_to_monitor]
             
-            self.logger.info(f"Monitoring all channels for generations: {monitored_channels}")
+            self.logger.info(f"Monitoring channels: {monitored_channels}")
             
-            # Rest of the method remains the same, but remove the 'gens' channel check
-            all_attachments = []
-            for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
-                channel_id, message_id = cache_key.split(":")
-                self.logger.debug(f"Processing cache item for channel {channel_id}")
+            # Get all video attachments from stored attachments
+            video_attachments = []
+            self.logger.info(f"Processing {len(self.current_summary_attachments)} stored attachments")
+            
+            # Track all videos separately from other attachments
+            for item in self.current_summary_attachments:
+                channel = item['channel']
+                message = item['message']
                 
-                # Skip if channel is not in monitored list
+                # Skip if channel not in monitored list
+                if isinstance(channel, discord.TextChannel):
+                    channel_id = channel.id
+                else:  # Handle dict case for test data
+                    channel_id = channel.get('id') or int(os.getenv('TEST_DATA_CHANNEL'))
+                    
                 if channel_id not in monitored_channels:
                     self.logger.debug(f"Skipping channel {channel_id} - not in monitored list")
                     continue
                     
-                # Get the channel to check its name
-                channel = self.get_channel(int(channel_id))
-                if not channel:
-                    self.logger.warning(f"Could not find channel {channel_id}")
+                # Skip if channel name contains 'support'
+                if 'support' in channel.name.lower():
                     continue
                     
-                # Only skip support channels, allow gens channels
+                for attachment in item['attachments']:
+                    # More lenient video check
+                    is_video = (attachment.content_type and 
+                               ('video' in attachment.content_type.lower()))
+                    
+                    if is_video:
+                        reaction_count = sum(r.count for r in message.reactions) if message.reactions else 0
+                        self.logger.info(f"Found video in {channel.name} with {reaction_count} reactions")
+                        
+                        # Get unique reactors
+                        unique_reactors = set()
+                        for reaction in message.reactions:
+                            async for user in reaction.users():
+                                unique_reactors.add(user.id)
+                        
+                        if len(unique_reactors) > 3:
+                            video_attachments.append({
+                                'message': message,
+                                'attachment': attachment,
+                                'channel_name': channel.name,
+                                'reaction_count': reaction_count,
+                                'unique_reactors': len(unique_reactors),
+                                'username': message.author.name
+                            })
+                            self.logger.info(f"Added video to top generations list")
+
+            # Process cached attachments as well
+            for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
+                channel_id, message_id = cache_key.split(":")
+                channel = self.get_channel(int(channel_id))
+                
+                if not channel or channel_id not in monitored_channels:
+                    continue
+                    
                 if 'support' in channel.name.lower():
-                    self.logger.debug(f"Skipping support channel: {channel.name}")
                     continue
                     
                 for attachment in cache_data['attachments']:
-                    # Only include video files
                     if any(attachment.filename.lower().endswith(ext) 
                           for ext in ('.mp4', '.mov', '.webm', '.avi')):
-                        self.logger.info(f"Found video file: {attachment.filename}")
-                        
-                        # Get the message to count unique reactors
                         try:
                             message = await channel.fetch_message(int(message_id))
                             unique_reactors = set()
@@ -1543,50 +1554,39 @@ Full summary to work from:
                                 async for user in reaction.users():
                                     unique_reactors.add(user.id)
                             
-                            self.logger.info(f"Message {message_id} has {len(unique_reactors)} unique reactors")
-                            
-                            all_attachments.append({
-                                'attachment': attachment,
-                                'reaction_count': len(unique_reactors),
-                                'username': cache_data['username'],
-                                'message_id': message_id,
-                                'channel_id': channel_id,
-                                'channel_name': channel.name,
-                                'message': message,
-                                'unique_reactors': len(unique_reactors)
-                            })
-                            self.logger.info(f"Added attachment to processing list")
-                        except discord.NotFound:
-                            self.logger.warning(f"Message {message_id} not found in channel {channel.name}")
-                            continue
+                            if len(unique_reactors) > 3:
+                                video_attachments.append({
+                                    'message': message,
+                                    'attachment': attachment,
+                                    'channel_name': channel.name,
+                                    'reaction_count': len(unique_reactors),
+                                    'username': cache_data['username'],
+                                    'unique_reactors': len(unique_reactors)
+                                })
                         except Exception as e:
-                            self.logger.error(f"Error fetching message reactions: {e}")
-                            self.logger.debug(traceback.format_exc())
+                            self.logger.error(f"Error processing cached video: {e}")
                             continue
 
-            self.logger.info(f"Found {len(all_attachments)} total video attachments")
+            # Sort by unique reactor count
+            video_attachments.sort(key=lambda x: x['unique_reactors'], reverse=True)
+            
+            # Take top 10 but include ALL videos that meet criteria
+            top_generations = video_attachments[:10]
 
-            # Filter for attachments with >3 reactors before sorting
-            filtered_attachments = [
-                att for att in all_attachments 
-                if att['unique_reactors'] > 3
-            ]
+            # Rest of the method remains the same...
 
-            self.logger.info(f"Found {len(filtered_attachments)} video attachments with >3 reactions")
-
-            if not filtered_attachments:
-                # Don't create a thread if there are no qualifying generations
-                self.logger.info("No video generations with >3 reactions - skipping thread creation")
+            # Check if we have any videos before proceeding
+            if not video_attachments:
+                self.logger.info("No qualifying videos found - skipping top generations thread")
                 return
+            
+            # Sort by unique reactor count
+            video_attachments.sort(key=lambda x: x['unique_reactors'], reverse=True)
+            
+            # Take top 10 but include ALL videos that meet criteria
+            top_generations = video_attachments[:10]
 
-            # Sort by unique reactor count and get top 10
-            top_generations = sorted(
-                filtered_attachments, 
-                key=lambda x: x['unique_reactors'], 
-                reverse=True
-            )[:10]
-
-            self.logger.info(f"Selected top {len(top_generations)} generations")
+            # Rest of the method remains the same...
 
             # Get the top generation for the header message
             top_gen = top_generations[0]
@@ -1695,15 +1695,36 @@ Full summary to work from:
             self.logger.debug(traceback.format_exc())
             raise
 
+    async def close(self):
+        """Override close to handle cleanup"""
+        try:
+            self.logger.info("Starting bot cleanup...")
+            
+            # Close aiohttp session if it exists and isn't closed
+            if hasattr(self, 'session') and self.session and not self.session.closed:
+                self.logger.info("Closing aiohttp session...")
+                await self.session.close()
+            
+            # Close any remaining connections
+            if hasattr(self, 'claude'):
+                self.logger.info("Cleaning up Claude client...")
+                self.claude = None
+            
+            self.logger.info("Cleanup completed, calling parent close...")
+            await super().close()
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+            self.logger.debug(traceback.format_exc())
+            # Still try to close parent even if we had an error
+            await super().close()
+
 async def schedule_daily_summary(bot):
     """
-    Schedule daily summaries with error handling and recovery.
+    Run daily summaries on schedule. Only exits if there's an error or explicit shutdown.
     """
-    consecutive_failures = 0
-    max_consecutive_failures = 3
-    
-    while True:
-        try:
+    try:
+        while not bot._shutdown_flag:  # Add loop to keep running
             now = datetime.utcnow()
             target = now.replace(hour=10, minute=0, second=0, microsecond=0)
             
@@ -1713,26 +1734,25 @@ async def schedule_daily_summary(bot):
             delay = (target - now).total_seconds()
             bot.logger.info(f"Waiting {delay/3600:.2f} hours until next summary at {target} UTC")
             
-            await asyncio.sleep(delay)
-            
-            await bot.generate_summary()
-            bot.logger.info(f"Summary generated successfully at {datetime.utcnow()} UTC")
-            # Reset failure counter on success
-            consecutive_failures = 0
-            
-        except Exception as e:
-            consecutive_failures += 1
-            bot.logger.error(f"Error in scheduler (failure {consecutive_failures}): {e}")
-            bot.logger.debug(traceback.format_exc())
-            
-            if consecutive_failures >= max_consecutive_failures:
-                bot.logger.critical(f"Too many consecutive failures ({consecutive_failures}). "
-                              f"Stopping scheduler.")
-                # Optionally notify administrators
-                raise
-            
-            # Wait for a short period before retrying
-            await asyncio.sleep(300)  # 5 minutes
+            try:
+                await asyncio.sleep(delay)
+                await bot.generate_summary()
+                bot.logger.info(f"Summary generated successfully at {datetime.utcnow()} UTC")
+            except asyncio.CancelledError:
+                bot.logger.info("Summary schedule cancelled - shutting down")
+                break
+            except Exception as e:
+                bot.logger.error(f"Error generating summary: {e}")
+                bot.logger.debug(traceback.format_exc())
+                # Wait 1 hour before retrying on error
+                await asyncio.sleep(3600)
+                
+    except Exception as e:
+        bot.logger.error(f"Fatal error in scheduler: {e}")
+        bot.logger.debug(traceback.format_exc())
+        bot._shutdown_flag = True  # Signal shutdown on fatal error
+        await bot.close()
+        raise
 
 def main():
     # Parse command line arguments FIRST
@@ -1773,23 +1793,28 @@ def main():
                 await bot.generate_summary()
                 bot.logger.info("Summary process completed. Shutting down...")
             finally:
-                # Only close sessions and shutdown in immediate mode
-                if bot.session and not bot.session.closed:
-                    await bot.session.close()
+                bot._shutdown_flag = True  # Signal for shutdown
                 await bot.close()
         else:
-            # Start the scheduler for regular operation
-            loop.create_task(schedule_daily_summary(bot))
+            # Add a flag to prevent multiple scheduler starts
+            if not hasattr(bot, '_scheduler_started'):
+                bot._scheduler_started = True
+                bot.logger.info("Starting scheduled mode - will run daily at 10:00 UTC")
+                loop.create_task(schedule_daily_summary(bot))
     
     # Run the bot with proper cleanup
     try:
         loop.run_until_complete(bot.start(bot_token))
     except KeyboardInterrupt:
         bot.logger.info("Keyboard interrupt received - shutting down...")
-        # Only do full cleanup on keyboard interrupt
+    finally:
+        # Only do full cleanup on shutdown
         try:
+            loop.run_until_complete(asyncio.sleep(1))  # Give tasks a moment to complete
+            
             # Cancel all running tasks
-            tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            tasks = [t for t in asyncio.all_tasks(loop) 
+                    if not t.done() and t != asyncio.current_task(loop)]
             if tasks:
                 bot.logger.info(f"Cancelling {len(tasks)} pending tasks...")
                 for task in tasks:
@@ -1798,13 +1823,22 @@ def main():
             
             # Close the bot connection
             if not loop.is_closed():
+                bot.logger.info("Closing bot connection...")
                 loop.run_until_complete(bot.close())
+                
+        except Exception as e:
+            bot.logger.error(f"Error during shutdown: {e}")
+            bot.logger.debug(traceback.format_exc())
+            
         finally:
-            bot.logger.info("Closing event loop...")
-            loop.close()
-    else:
-        # In normal operation, just keep running
-        loop.run_forever()
+            if not loop.is_closed():
+                bot.logger.info("Closing event loop...")
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+            
+        # Only exit if we're in immediate mode
+        if getattr(bot, '_shutdown_flag', False):
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()
