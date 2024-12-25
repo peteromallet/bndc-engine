@@ -36,34 +36,98 @@ def setup_logging(dev_mode=False):
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
     
-    # File handler with rotation - different settings for dev/prod
-    if dev_mode:
-        log_file = 'discord_bot_dev.log'
-        max_bytes = 512 * 1024  # 512KB per file for more frequent rotation in dev
-        backup_count = 200  # Keep 200 backup files in dev mode
-    else:
-        log_file = 'discord_bot.log'
-        max_bytes = 1024 * 1024  # 1MB per file in prod
-        backup_count = 5  # Keep 5 backup files in prod
-    
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=max_bytes,
-        backupCount=backup_count,
+    # Production file handler (always active)
+    prod_log_file = 'discord_bot.log'
+    prod_handler = RotatingFileHandler(
+        prod_log_file,
+        maxBytes=1024 * 1024,  # 1MB per file
+        backupCount=5,
         encoding='utf-8'
     )
-    file_handler.setLevel(logging.DEBUG if dev_mode else logging.INFO)
-    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
+    prod_handler.setLevel(logging.INFO)
+    prod_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    prod_handler.setFormatter(prod_formatter)
+    logger.addHandler(prod_handler)
+    
+    # Development file handler (only when in dev mode)
+    if dev_mode:
+        dev_log_file = 'discord_bot_dev.log'
+        dev_handler = LineCountRotatingFileHandler(
+            dev_log_file,
+            maxBytes=512 * 1024,  # 512KB per file
+            backupCount=200,
+            encoding='utf-8',
+            max_lines=200
+        )
+        dev_handler.setLevel(logging.DEBUG)
+        dev_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        dev_handler.setFormatter(dev_formatter)
+        
+        # Only do rollover if file exists AND exceeds limits
+        if os.path.exists(dev_log_file):
+            if os.path.getsize(dev_log_file) > 512 * 1024:
+                dev_handler.doRollover()
+            else:
+                # Count lines in existing file
+                with open(dev_log_file, 'r', encoding='utf-8') as f:
+                    line_count = sum(1 for _ in f)
+                if line_count > 200:
+                    dev_handler.doRollover()
+        
+        logger.addHandler(dev_handler)
     
     # Log the logging configuration
     logger.info(f"Logging configured in {'development' if dev_mode else 'production'} mode")
-    logger.info(f"Log file: {log_file}")
-    logger.info(f"Backup count: {backup_count}")
-    logger.info(f"Max bytes per file: {max_bytes}")
+    logger.info(f"Production log file: {prod_log_file}")
+    if dev_mode:
+        logger.info(f"Development log file: {dev_log_file}")
     
     return logger
+
+class LineCountRotatingFileHandler(RotatingFileHandler):
+    """A handler that rotates based on both size and line count"""
+    def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, 
+                 encoding=None, delay=False, max_lines=None):
+        super().__init__(filename, mode, maxBytes, backupCount, encoding, delay)
+        self.max_lines = max_lines
+        
+        # Initialize line count from existing file
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding=encoding or 'utf-8') as f:
+                self.line_count = sum(1 for _ in f)
+        else:
+            self.line_count = 0
+    
+    def doRollover(self):
+        """Override doRollover to keep last N lines"""
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+            
+        if self.max_lines:
+            # Read all lines from the current file
+            with open(self.baseFilename, 'r', encoding=self.encoding) as f:
+                lines = f.readlines()
+            
+            # Keep only the last max_lines
+            lines = lines[-self.max_lines:]
+            
+            # Write the last max_lines back to the file
+            with open(self.baseFilename, 'w', encoding=self.encoding) as f:
+                f.writelines(lines)
+            
+            self.line_count = len(lines)
+        
+        if not self.delay:
+            self.stream = self._open()
+    
+    def emit(self, record):
+        """Emit a record and check line count"""
+        if self.max_lines and self.line_count >= self.max_lines:
+            self.doRollover()
+            
+        super().emit(record)
+        self.line_count += 1
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -159,20 +223,9 @@ class Attachment:
         self.reaction_count = reaction_count
         self.username = username
 
-class MessageData:
-    def __init__(self, content: str, author: str, timestamp: datetime, jump_url: str, reactions: int, id: str, attachments: List[Attachment]):
-        self.content = content
-        self.author = author
-        self.timestamp = timestamp
-        self.jump_url = jump_url
-        self.reactions = reactions
-        self.id = id
-        self.attachments = attachments
-
 class AttachmentHandler:
     def __init__(self, max_size: int = 25 * 1024 * 1024):
         self.max_size = max_size
-        # Add channel_id to make the cache structure clearer
         self.attachment_cache: Dict[str, Dict[str, Any]] = {}
         self.logger = logging.getLogger('ChannelSummarizer')
         
@@ -183,11 +236,8 @@ class AttachmentHandler:
     async def process_attachment(self, attachment: discord.Attachment, message: discord.Message, session: aiohttp.ClientSession) -> Optional[Attachment]:
         """Process a single attachment with size and type validation."""
         try:
-            self.logger.debug(f"Processing attachment {attachment.filename} from message {message.id} in channel {message.channel.id}")
-            
-            # Create composite key that includes channel ID
+            # Remove excessive debug logging
             cache_key = f"{message.channel.id}:{message.id}"
-            self.logger.debug(f"Creating cache key: {cache_key}")
             
             async with session.get(attachment.url, timeout=300) as response:
                 if response.status != 200:
@@ -208,7 +258,6 @@ class AttachmentHandler:
                     username=message.author.name
                 )
 
-                # Store with channel context
                 if cache_key not in self.attachment_cache:
                     self.attachment_cache[cache_key] = {
                         'attachments': [],
@@ -359,25 +408,18 @@ class ChannelSummarizer(commands.Bot):
             gateway_queue_size=512
         )
         
-        self._dev_mode = False
-        self.logger = setup_logging(dev_mode=False)  # Initial setup with production mode
+        # Remove initial dev_mode setting and logger setup
+        self._dev_mode = None
+        self.logger = None
         
         self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
         self.session = None
-
-        self.summary_channel_id = int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))
-        self.guild_id = int(os.getenv('GUILD_ID'))
-
-        self.logger.info("Bot initialized with:")  # Changed from logger to self.logger
-        self.logger.info(f"Guild ID: {self.guild_id}")  # Changed from logger to self.logger
-        self.logger.info(f"Summary Channel: {self.summary_channel_id}")  # Changed from logger to self.logger
-
+        
         self.rate_limiter = RateLimiter()
         self.attachment_handler = AttachmentHandler()
         self.message_formatter = MessageFormatter()
         self.db = DatabaseHandler()
         self.error_handler = ErrorHandler()
-        self.dev_mode = False
         
         self.guild_id = None
         self.summary_channel_id = None
@@ -385,17 +427,27 @@ class ChannelSummarizer(commands.Bot):
         self.dev_channels_to_monitor = []
         self.first_message = None
 
+    def setup_logger(self, dev_mode):
+        """Initialize or update logger configuration"""
+        # Always recreate logger when explicitly setting up
+        self.logger = setup_logging(dev_mode)
+        
+        # Now that logger is set up, we can log initialization info
+        if self.logger:
+            self.logger.info("Bot initializing...")
+            if dev_mode:
+                self.logger.debug("Development mode enabled")
+
     @property
     def dev_mode(self):
         return self._dev_mode
 
     @dev_mode.setter
     def dev_mode(self, value):
-        self._dev_mode = value
-        # Update logger when dev mode changes
-        self.logger = setup_logging(dev_mode=value)
-        if value:
-            self.logger.debug("Development mode enabled - detailed logging activated")
+        """Set development mode and reconfigure logger"""
+        if self._dev_mode != value:
+            self._dev_mode = value
+            self.setup_logger(value)  # Reconfigure logger with new mode
 
     def load_config(self):
         """Load configuration based on mode"""
@@ -465,9 +517,18 @@ class ChannelSummarizer(commands.Bot):
         """Get channel history with support for test data channel in dev mode"""
         if self.dev_mode:
             try:
+                # Remove excessive environment logging
+                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
+                test_channel = self.get_channel(test_channel_id)
+                
+                if not test_channel:
+                    self.logger.error(f"Could not find channel with ID {test_channel_id}")
+                    return []
+                
+                yesterday = datetime.now(timezone.utc) - timedelta(days=1)
                 # Add detailed environment logging
                 self.logger.debug("Environment state in get_channel_history:")
-                self.logger.debug(f"All environment variables containing 'CHANNEL':")
+                self.logger.debug("All environment variables containing 'CHANNEL':")
                 for key, value in os.environ.items():
                     if 'CHANNEL' in key:
                         self.logger.debug(f"{key}: {value}")
@@ -793,7 +854,7 @@ Full summary to work from:
             self.logger.info(f"Creating thread for message {message.id}, attempt 1")
             
             # Only add "Detailed Summary" prefix if it's not a top generations thread
-            thread_name_with_prefix = thread_name if is_top_generations else f"������ Detailed Summary - {thread_name}"
+            thread_name_with_prefix = thread_name if is_top_generations else f" Detailed Summary - {thread_name}"
             
             thread = await message.create_thread(
                 name=thread_name_with_prefix,
@@ -1404,70 +1465,6 @@ Full summary to work from:
             self.logger.error(f"Error sending message: {e}")
             raise
 
-    async def get_reddit_suggestion(self, summary: str) -> Optional[dict]:
-        """
-        Analyze summary for potential Reddit content.
-        Returns dict with title and topic if found, None otherwise.
-        """
-        self.logger.info("Analyzing summary for Reddit potential")
-        
-        prompt = """Analyze this Discord summary and determine if any topic would make for an engaging Reddit post. 
-
-Examples of good Reddit topics:
-- Novel technical achievements or discoveries
-- Unique creative techniques that others could learn from
-- Interesting workflow improvements or optimizations
-- Surprising or counter-intuitive findings
-- New ways of combining existing tools
-
-Examples of bad Reddit topics:
-- Basic questions or troubleshooting
-- Personal projects without broader interest
-- Bug reports or issues
-- General chat or discussions
-- Already widely known information
-
-If you find a suitable topic, respond with a proposed Reddit title and the relevant topic text. If not, respond with exactly "NO_REDDIT_CONTENT".
-
-Summary to analyze:
-{summary}"""
-
-        try:
-            loop = asyncio.get_running_loop()
-            
-            def create_reddit_analysis():
-                return self.claude.messages.create(
-                    model="claude-3-5-haiku-latest",
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-            
-            self.logger.debug("Sending request to Claude for Reddit analysis")
-            response = await loop.run_in_executor(None, create_reddit_analysis)
-            result = response.content[0].text.strip()
-            
-            if result == "NO_REDDIT_CONTENT":
-                self.logger.info("No Reddit-worthy content found")
-                return None
-            
-            # Parse title and content from response
-            lines = result.split('\n')
-            if len(lines) >= 2:
-                suggestion = {
-                    'title': lines[0].strip(),
-                    'content': '\n'.join(lines[1:]).strip()
-                }
-                self.logger.info(f"Found potential Reddit post: {suggestion['title']}")
-                return suggestion
-            
-            self.logger.warning("Invalid response format from Claude")
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error getting Reddit suggestion: {e}")
-            self.logger.debug(traceback.format_exc())
-            return None
-
     async def create_media_content(self, files: List[Tuple[discord.File, int, str, str]], max_media: int = 4) -> Optional[discord.File]:
         """Create either a collage of images or a combined video based on media type."""
         try:
@@ -1591,31 +1588,6 @@ Summary to analyze:
                     except Exception as e:
                         self.logger.warning(f"Failed to remove temporary file {f}: {e}")
 
-    async def send_reddit_suggestion(self, suggestion: dict, files: List[Tuple[discord.File, int, str, str]]):
-        """Send Reddit post suggestion to specified user."""
-        try:
-            self.logger.info("Attempting to send Reddit suggestion")
-            user = await self.fetch_user(301463647895683072)
-            if not user:
-                self.logger.error("Could not find target user")
-                return
-            
-            # Create media content
-            media = None
-            if files:
-                self.logger.info(f"Creating media content from {len(files)} files")
-                media = await self.create_media_content(files)
-            
-            message = f"**Potential Reddit Post Idea**\n\nTitle: {suggestion['title']}\n\nBased on: {suggestion['content']}"
-            
-            self.logger.debug(f"Sending message to user {user.name}")
-            await user.send(message, file=media if media else None)
-            self.logger.info("Reddit suggestion sent successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Error sending Reddit suggestion: {e}")
-            self.logger.debug(traceback.format_exc())
-
     async def create_top_generations_thread(self, summary_channel):
         """Creates a thread showcasing the top video generations with >3 reactors."""
         try:
@@ -1708,18 +1680,8 @@ Summary to analyze:
             self.logger.info(f"Found {len(filtered_attachments)} video attachments with >3 reactions")
 
             if not filtered_attachments:
-                # Just create a thread with title if no qualifying generations
-                self.logger.info("No video generations with >3 reactions - creating empty thread")
-                header_message = await self.safe_send_message(
-                    summary_channel,
-                    "# 🎬 Today's Generations"
-                )
-                
-                thread = await self.create_summary_thread(
-                    header_message,
-                    "Top-Generations",
-                    is_top_generations=True
-                )
+                # Don't create a thread if there are no qualifying generations
+                self.logger.info("No video generations with >3 reactions - skipping thread creation")
                 return
 
             # Sort by unique reactor count and get top 10
@@ -1880,17 +1842,18 @@ async def schedule_daily_summary(bot):
 def main():
     # Parse command line arguments FIRST
     parser = argparse.ArgumentParser(description='Discord Channel Summarizer Bot')
-    parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately instead of waiting for scheduled time')
-    parser.add_argument('--dev', action='store_true', help='Run in development mode using test data')
+    parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately')
+    parser.add_argument('--dev', action='store_true', help='Run in development mode')
     args = parser.parse_args()
     
-    # Create logger for main function with the parsed args
-    main_logger = setup_logging(dev_mode=args.dev)
-    
-    # Create and run the bot
+    # Create and configure the bot
     bot = ChannelSummarizer()
+    
+    # Set dev mode before any other initialization
     bot.dev_mode = args.dev
-    bot.load_config()  # This will load the .env file once
+    
+    # Now load config and continue initialization
+    bot.load_config()
     
     # Get bot token after loading config
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
@@ -1898,7 +1861,7 @@ def main():
         raise ValueError("Discord bot token not found in environment variables")
     
     if args.dev:
-        main_logger.info("Running in DEVELOPMENT mode - using test data")
+        bot.logger.info("Running in DEVELOPMENT mode - using test data")  # Changed from main_logger to bot.logger
     
     # Create event loop
     loop = asyncio.get_event_loop()
@@ -1927,13 +1890,13 @@ def main():
     try:
         loop.run_until_complete(bot.start(bot_token))
     except KeyboardInterrupt:
-        main_logger.info("Keyboard interrupt received - shutting down...")
+        bot.logger.info("Keyboard interrupt received - shutting down...")
         # Only do full cleanup on keyboard interrupt
         try:
             # Cancel all running tasks
             tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
             if tasks:
-                main_logger.info(f"Cancelling {len(tasks)} pending tasks...")
+                bot.logger.info(f"Cancelling {len(tasks)} pending tasks...")
                 for task in tasks:
                     task.cancel()
                 loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
@@ -1942,7 +1905,7 @@ def main():
             if not loop.is_closed():
                 loop.run_until_complete(bot.close())
         finally:
-            main_logger.info("Closing event loop...")
+            bot.logger.info("Closing event loop...")
             loop.close()
     else:
         # In normal operation, just keep running

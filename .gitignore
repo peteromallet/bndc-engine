@@ -39,3 +39,7 @@ logs/
 
 # cache
 cache/
+
+# Log files
+discord_bot_dev.log*
+discord_bot.log*
