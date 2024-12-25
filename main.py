@@ -19,115 +19,7 @@ from utils.errors import *
 from utils.error_handler import ErrorHandler, handle_errors
 import json
 from logging.handlers import RotatingFileHandler
-
-# Configure logging
-def setup_logging(dev_mode=False):
-    """Configure logging with separate files for dev/prod and rotation"""
-    logger = logging.getLogger('ChannelSummarizer')
-    logger.setLevel(logging.DEBUG if dev_mode else logging.INFO)
-    
-    # Clear any existing handlers
-    logger.handlers.clear()
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if dev_mode else logging.INFO)
-    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
-    
-    # Production file handler (always active)
-    prod_log_file = 'discord_bot.log'
-    prod_handler = RotatingFileHandler(
-        prod_log_file,
-        maxBytes=1024 * 1024,  # 1MB per file
-        backupCount=5,
-        encoding='utf-8'
-    )
-    prod_handler.setLevel(logging.INFO)
-    prod_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    prod_handler.setFormatter(prod_formatter)
-    logger.addHandler(prod_handler)
-    
-    # Development file handler (only when in dev mode)
-    if dev_mode:
-        dev_log_file = 'discord_bot_dev.log'
-        dev_handler = LineCountRotatingFileHandler(
-            dev_log_file,
-            maxBytes=512 * 1024,  # 512KB per file
-            backupCount=200,
-            encoding='utf-8',
-            max_lines=200
-        )
-        dev_handler.setLevel(logging.DEBUG)
-        dev_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        dev_handler.setFormatter(dev_formatter)
-        
-        # Only do rollover if file exists AND exceeds limits
-        if os.path.exists(dev_log_file):
-            if os.path.getsize(dev_log_file) > 512 * 1024:
-                dev_handler.doRollover()
-            else:
-                # Count lines in existing file
-                with open(dev_log_file, 'r', encoding='utf-8') as f:
-                    line_count = sum(1 for _ in f)
-                if line_count > 200:
-                    dev_handler.doRollover()
-        
-        logger.addHandler(dev_handler)
-    
-    # Log the logging configuration
-    logger.info(f"Logging configured in {'development' if dev_mode else 'production'} mode")
-    logger.info(f"Production log file: {prod_log_file}")
-    if dev_mode:
-        logger.info(f"Development log file: {dev_log_file}")
-    
-    return logger
-
-class LineCountRotatingFileHandler(RotatingFileHandler):
-    """A handler that rotates based on both size and line count"""
-    def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, 
-                 encoding=None, delay=False, max_lines=None):
-        super().__init__(filename, mode, maxBytes, backupCount, encoding, delay)
-        self.max_lines = max_lines
-        
-        # Initialize line count from existing file
-        if os.path.exists(filename):
-            with open(filename, 'r', encoding=encoding or 'utf-8') as f:
-                self.line_count = sum(1 for _ in f)
-        else:
-            self.line_count = 0
-    
-    def doRollover(self):
-        """Override doRollover to keep last N lines"""
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-            
-        if self.max_lines:
-            # Read all lines from the current file
-            with open(self.baseFilename, 'r', encoding=self.encoding) as f:
-                lines = f.readlines()
-            
-            # Keep only the last max_lines
-            lines = lines[-self.max_lines:]
-            
-            # Write the last max_lines back to the file
-            with open(self.baseFilename, 'w', encoding=self.encoding) as f:
-                f.writelines(lines)
-            
-            self.line_count = len(lines)
-        
-        if not self.delay:
-            self.stream = self._open()
-    
-    def emit(self, record):
-        """Emit a record and check line count"""
-        if self.max_lines and self.line_count >= self.max_lines:
-            self.doRollover()
-            
-        super().emit(record)
-        self.line_count += 1
+from utils.log_handler import LogHandler
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -408,9 +300,13 @@ class ChannelSummarizer(commands.Bot):
             gateway_queue_size=512
         )
         
-        # Remove initial dev_mode setting and logger setup
         self._dev_mode = None
         self.logger = None
+        self.log_handler = LogHandler(
+            logger_name='ChannelSummarizer',
+            prod_log_file='discord_bot.log',
+            dev_log_file='discord_bot_dev.log'
+        )
         
         self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
         self.session = None
@@ -429,8 +325,7 @@ class ChannelSummarizer(commands.Bot):
 
     def setup_logger(self, dev_mode):
         """Initialize or update logger configuration"""
-        # Always recreate logger when explicitly setting up
-        self.logger = setup_logging(dev_mode)
+        self.logger = self.log_handler.setup_logging(dev_mode)
         
         # Now that logger is set up, we can log initialization info
         if self.logger:
