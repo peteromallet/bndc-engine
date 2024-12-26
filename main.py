@@ -21,6 +21,7 @@ import json
 from logging.handlers import RotatingFileHandler
 from utils.log_handler import LogHandler
 import sys
+from utils.rate_limiter import RateLimiter
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -37,76 +38,6 @@ class DiscordError(ChannelSummarizerError):
 class SummaryError(ChannelSummarizerError):
     """Raised when summary generation fails"""
     pass
-
-class RateLimiter:
-    """Manages rate limiting for Discord API calls with exponential backoff."""
-    
-    def __init__(self):
-        self.backoff_times = {}  # Store backoff times per channel
-        self.base_delay = 1.0    # Base delay in seconds
-        self.max_delay = 64.0    # Maximum delay in seconds
-        self.jitter = 0.1        # Random jitter factor
-        
-    async def execute(self, key, coroutine):
-        """
-        Executes a coroutine with rate limit handling.
-        
-        Args:
-            key: Identifier for the rate limit (e.g., channel_id)
-            coroutine: The coroutine to execute
-            
-        Returns:
-            The result of the coroutine execution
-        """
-        max_retries = 5
-        attempt = 0
-        
-        while attempt < max_retries:
-            try:
-                # Add jitter to prevent thundering herd
-                if key in self.backoff_times:
-                    jitter = random.uniform(-self.jitter, self.jitter)
-                    await asyncio.sleep(self.backoff_times[key] * (1 + jitter))
-                
-                result = await coroutine
-                
-                # Reset backoff on success
-                self.backoff_times[key] = self.base_delay
-                return result
-                
-            except discord.HTTPException as e:
-                attempt += 1
-                
-                if e.status == 429:  # Rate limit hit
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else None
-                    
-                    if retry_after:
-                        self.logger.warning(f"Rate limit hit for {key}. Retry after {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                    else:
-                        # Calculate exponential backoff
-                        current_delay = self.backoff_times.get(key, self.base_delay)
-                        next_delay = min(current_delay * 2, self.max_delay)
-                        self.backoff_times[key] = next_delay
-                        
-                        self.logger.warning(f"Rate limit hit for {key}. Using exponential backoff: {next_delay}s")
-                        await asyncio.sleep(next_delay)
-                        
-                elif attempt == max_retries:
-                    self.logger.error(f"Failed after {max_retries} attempts: {e}")
-                    raise
-                else:
-                    self.logger.warning(f"Discord API error (attempt {attempt}/{max_retries}): {e}")
-                    # Calculate exponential backoff for other errors
-                    current_delay = self.backoff_times.get(key, self.base_delay)
-                    next_delay = min(current_delay * 2, self.max_delay)
-                    self.backoff_times[key] = next_delay
-                    await asyncio.sleep(next_delay)
-            
-            except Exception as e:
-                self.logger.error(f"Unexpected error: {e}")
-                self.logger.debug(traceback.format_exc())
-                raise
 
 class Attachment:
     def __init__(self, filename: str, data: bytes, content_type: str, reaction_count: int, username: str):
@@ -1306,6 +1237,14 @@ Full summary to work from:
                         self.logger.debug(traceback.format_exc())
                         # Don't raise here to allow the rest of the summary to complete
 
+                # Add the top art share post regardless of active channels
+                try:
+                    await self.post_top_art_share(summary_channel)
+                    self.logger.info("Top art share posted")
+                except Exception as e:
+                    self.logger.error(f"Failed to post top art share: {e}")
+                    self.logger.debug(traceback.format_exc())
+
                 # Add footer with jump link at the very end
                 if self.first_message:
                     footer_text = f"""---
@@ -1694,6 +1633,83 @@ Full summary to work from:
             self.logger.error(f"Error creating top generations thread: {e}")
             self.logger.debug(traceback.format_exc())
             raise
+
+    async def post_top_art_share(self, summary_channel):
+        """Posts the most reacted-to art share from the art sharing channel in the last 24 hours."""
+        try:
+            self.logger.info("Starting post_top_art_share")
+            
+            # Get correct art sharing channel ID based on mode
+            art_channel_id = int(os.getenv('DEV_ART_SHARING_CHANNEL_ID' if self.dev_mode else 'ART_SHARING_CHANNEL_ID'))
+            self.logger.info(f"Art channel ID: {art_channel_id}")
+            
+            art_channel = self.get_channel(art_channel_id)
+            
+            if not art_channel:
+                self.logger.error(f"Could not access art sharing channel {art_channel_id}")
+                return
+            
+            self.logger.info(f"Processing art channel: {art_channel.name}")
+            
+            # Get last 24 hours of messages
+            yesterday = datetime.utcnow() - timedelta(days=1)
+            top_art = None
+            max_unique_reactors = 0
+            
+            message_count = 0
+            async for message in art_channel.history(after=yesterday, limit=None):
+                message_count += 1
+                if not message.attachments:
+                    continue
+                
+                # Count unique reactors
+                unique_reactors = set()
+                for reaction in message.reactions:
+                    async for user in reaction.users():
+                        unique_reactors.add(user.id)
+                
+                if len(unique_reactors) > max_unique_reactors:
+                    max_unique_reactors = len(unique_reactors)
+                    top_art = message
+            
+            self.logger.info(f"Processed {message_count} messages from art channel")
+            
+            if top_art and max_unique_reactors > 0:
+                self.logger.info(f"Found top art with {max_unique_reactors} reactions")
+                # Get the first attachment
+                file = await top_art.attachments[0].to_file()
+                
+                # Format the message differently based on mode
+                content = [f"# Top <#{art_channel.id}>  Post Today", ""]  # Start with title and empty line
+                
+                # Always include author, but format differently based on mode
+                if self.dev_mode:
+                    content.append(f"By: **{top_art.author.name}**")  # Just bold the name in dev mode
+                else:
+                    content.append(f"By: <@{top_art.author.id}>")  # Tag the user in production mode
+                
+                # Add comment if there is one (in both modes)
+                if top_art.content:
+                    content.append(f"💭 *\"{top_art.content}\"*")  # Add emoji and italics for the quote
+                
+                # Add links (in both modes)
+                content.append(f"{top_art.jump_url}")
+                
+                # Join with newlines
+                formatted_content = "\n".join(content)
+                
+                await self.safe_send_message(
+                    summary_channel,
+                    formatted_content,
+                    file=file
+                )
+                self.logger.info("Posted top art share successfully")
+            else:
+                self.logger.info("No art posts with reactions found in the last 24 hours")
+
+        except Exception as e:
+            self.logger.error(f"Error posting top art share: {e}")
+            self.logger.debug(traceback.format_exc())
 
     async def close(self):
         """Override close to handle cleanup"""
