@@ -382,53 +382,67 @@ class ChannelSummarizer(commands.Bot):
             raise ConfigurationError("Failed to initialize bot", e)
 
     async def get_channel_history(self, channel_id: int) -> List[Union[discord.Message, dict]]:
-        """Get message history for a channel, using test data channel in dev mode"""
+        """Get message history for a channel, using test data channels in dev mode"""
         if self.dev_mode:
-            test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
-            self.logger.debug(f"TEST_DATA_CHANNEL: {test_channel_id}")
-            
-            # Get the actual test channel
-            test_channel = self.get_channel(test_channel_id)
-            if not test_channel:
-                self.logger.error(f"Could not find test channel {test_channel_id}")
+            # Get list of test channels from env var
+            test_channels_str = os.getenv('TEST_DATA_CHANNEL')
+            if not test_channels_str:
+                self.logger.error("No test data channels configured")
                 return []
-            
-            # Get real messages from the test channel
-            messages = []
-            async for message in test_channel.history(
-                limit=100,
-                after=datetime.utcnow() - timedelta(days=1)
-            ):
-                # Create a copy of the message with modified channel but preserve original URL
-                message_copy = copy.copy(message)
-                original_jump_url = message.jump_url  # Store original URL
-                message_copy.channel = self.get_channel(channel_id)  # Use the target channel
                 
-                # Store both original URL and channel ID
-                self.original_urls[message_copy.id] = {
-                    'url': original_jump_url,
-                    'channel_id': str(channel_id)  # Use target channel ID instead of original
-                }
+            try:
+                # Parse comma-separated channel IDs
+                test_channel_ids = [int(id.strip()) for id in test_channels_str.split(',')]
+                self.logger.debug(f"TEST_DATA_CHANNELS (from {test_channels_str}): {test_channel_ids}")
                 
-                messages.append(message_copy)
+                # Get a deterministic but rotating channel based on channel_id
+                channel_index = abs(hash(str(channel_id))) % len(test_channel_ids)
+                test_channel_id = test_channel_ids[channel_index]
                 
-                # Process attachments with target channel info
-                if message.attachments:
-                    async with aiohttp.ClientSession() as session:
-                        for attachment in message.attachments:
-                            # Use target channel ID for cache key
-                            processed = await self.attachment_handler.process_attachment(
-                                attachment, 
-                                message_copy,  # Use modified message with target channel
-                                session,
-                                original_jump_url=original_jump_url
-                            )
-            
-            self.logger.info(f"Loaded {len(messages)} messages from test data channel")
-            return messages
-        
+                # Get the actual test channel
+                test_channel = self.get_channel(test_channel_id)
+                if not test_channel:
+                    self.logger.error(f"Could not find test channel {test_channel_id}")
+                    return []
+                
+                self.logger.info(f"Using test channel {test_channel.name} ({test_channel_id}) for target channel {channel_id}")
+                
+                # Rest of the method remains the same...
+                messages = []
+                async for message in test_channel.history(
+                    limit=100,
+                    after=datetime.utcnow() - timedelta(days=1)
+                ):
+                    message_copy = copy.copy(message)
+                    original_jump_url = message.jump_url
+                    message_copy.channel = self.get_channel(channel_id)
+                    
+                    self.original_urls[message_copy.id] = {
+                        'url': original_jump_url,
+                        'channel_id': str(channel_id)
+                    }
+                    
+                    messages.append(message_copy)
+                    
+                    if message.attachments:
+                        async with aiohttp.ClientSession() as session:
+                            for attachment in message.attachments:
+                                processed = await self.attachment_handler.process_attachment(
+                                    attachment, 
+                                    message_copy,
+                                    session,
+                                    original_jump_url=original_jump_url
+                                )
+                
+                self.logger.info(f"Loaded {len(messages)} messages from test channel {test_channel.name}")
+                return messages
+                
+            except ValueError as e:
+                self.logger.error(f"Error parsing test channel IDs: {e}")
+                return []
+                
         else:
-            # Production mode remains unchanged
+            # Production mode remains unchanged...
             channel = self.get_channel(channel_id)
             if not channel:
                 raise DiscordError(f"Could not access channel {channel_id}")
@@ -905,10 +919,12 @@ Full summary to work from:
             self.logger.debug(traceback.format_exc())
             return set(), []
 
-    async def process_unused_attachments(self, thread, used_message_ids: Set[str], max_attachments: int = 10, 
-                                       previous_thread_id: Optional[str] = None, used_files: List[discord.File] = None,
+    async def process_unused_attachments(self, thread, used_message_ids: Set[str], channel_id: int,
+                                       max_attachments: int = 10, 
+                                       previous_thread_id: Optional[str] = None, 
+                                       used_files: List[discord.File] = None,
                                        is_source_thread: bool = False):
-        """Process and post any unused attachments from the channel."""
+        """Process and post any unused attachments from the specified channel."""
         try:
             # Track filenames that have been used
             used_filenames = set()
@@ -919,10 +935,14 @@ Full summary to work from:
                     else:
                         used_filenames.add(file.filename)
 
-            # Get unused attachments sorted by reaction count
+            # Modify the attachment collection to filter by channel_id
             unused_attachments = []
             for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
-                channel_part, message_id = cache_key.split(":", 1)
+                cache_channel_id, message_id = cache_key.split(':', 1)
+                
+                # Only process attachments from the specified channel
+                if int(cache_channel_id) != channel_id:
+                    continue  # Skip attachments from other channels
                 
                 # Skip if message was already used or has low reactions
                 if message_id not in used_message_ids and cache_data['reaction_count'] >= 3:
@@ -967,18 +987,11 @@ Full summary to work from:
                     message_content = f"By **{username}**: {jump_url}"
                     await self.safe_send_message(thread, message_content, file=file)
 
-            # Always add navigation links, regardless of whether there were attachments
-            try:
-                footer_text = "\n---\n\u200B\n"
+            # Only add navigation links in main summary thread, not source threads
+            if not is_source_thread:  # Add this condition
+                try:
+                    footer_text = "\n---\n\u200B\n"
 
-                if is_source_thread:  # If we're in the monthly/source thread
-                    # Only show one link - to the beginning of this thread
-                    async for first_message in thread.history(oldest_first=True, limit=1):
-                        footer_text += f"***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
-                        await self.safe_send_message(thread, footer_text)
-                        break
-                else:  # If we're in the main summary thread
-                    # Show both links - to monthly thread and to beginning of this thread
                     if previous_thread_id and str(previous_thread_id) != str(thread.id):
                         try:
                             previous_thread = await self.fetch_channel(previous_thread_id)
@@ -998,8 +1011,8 @@ Full summary to work from:
                         await self.safe_send_message(thread, footer_text)
                         break
 
-            except Exception as e:
-                self.logger.error(f"Failed to add thread links: {e}")
+                except Exception as e:
+                    self.logger.error(f"Failed to add thread links: {e}")
 
         except Exception as e:
             self.logger.error(f"Error processing unused attachments: {e}")
@@ -1156,6 +1169,7 @@ Full summary to work from:
             await self.process_unused_attachments(
                 thread, 
                 used_message_ids, 
+                channel_id=channel_id,  # Add this parameter
                 previous_thread_id=existing_thread_id,
                 used_files=used_files,
                 is_source_thread=False  # Main summary thread
@@ -1193,6 +1207,7 @@ Full summary to work from:
             await self.process_unused_attachments(
                 source_thread, 
                 used_message_ids, 
+                channel_id=channel_id,  # Add this parameter
                 max_attachments=3,
                 previous_thread_id=existing_thread_id,
                 is_source_thread=True  # Source channel thread
