@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import asyncio
 import logging
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 import os
 import sys
 
@@ -35,19 +35,32 @@ class ChannelCleaner(commands.Bot):
     async def delete_database_entries(self, channel_id: int):
         """Delete all database entries for a channel."""
         try:
+            # Get counts before deletion - handle case where query returns None
+            result = self.db.execute_query(
+                "SELECT COUNT(*) FROM daily_summaries WHERE channel_id = ?",
+                (channel_id,)
+            )
+            before_daily = result[0][0] if result else 0
+            
+            result = self.db.execute_query(
+                "SELECT COUNT(*) FROM channel_summary WHERE channel_id = ?",
+                (channel_id,)
+            )
+            before_summary = result[0][0] if result else 0
+            
             # Delete from daily_summaries
             self.db.execute_query(
                 "DELETE FROM daily_summaries WHERE channel_id = ?",
                 (channel_id,)
             )
-            logger.info(f"Deleted entries from daily_summaries for channel {channel_id}")
+            logger.info(f"Deleted {before_daily} entries from daily_summaries for channel {channel_id}")
             
             # Delete from channel_summary
             self.db.execute_query(
                 "DELETE FROM channel_summary WHERE channel_id = ?",
                 (channel_id,)
             )
-            logger.info(f"Deleted entries from channel_summary for channel {channel_id}")
+            logger.info(f"Deleted {before_summary} entries from channel_summary for channel {channel_id}")
             
             return True
             
@@ -60,14 +73,20 @@ class ChannelCleaner(commands.Bot):
         deleted_count = 0
         
         try:
+            # Add logging for initial message check
+            logger.info(f"Starting message deletion in channel: #{channel.name}")
+            
             # First check if there are any deletable messages
             has_deletable_messages = False
             message_count = 0
+            bot_message_count = 0
             async for message in channel.history(limit=None):
                 message_count += 1
                 if message.author.id == self.user.id:
                     has_deletable_messages = True
-                    break
+                    bot_message_count += 1
+            
+            logger.info(f"Channel #{channel.name} has {message_count} total messages, {bot_message_count} from bot")
             
             if not has_deletable_messages:
                 if isinstance(channel, discord.Thread):
@@ -175,40 +194,71 @@ class ChannelCleaner(commands.Bot):
 async def main():
     # Load environment variables
     load_dotenv()
+    
+    # Hardcode channels for testing
+    dev_channels = ['1320120559425818655', '1320122436703752252']
+    logger.info(f"Using hardcoded channel IDs: {dev_channels}")
+    
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
-    dev_channels = os.getenv('DEV_CHANNELS_TO_MONITOR', '').split(',')
     summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
+    
+    # Remove the environment variable parsing since we're using hardcoded values
     
     @bot.event
     async def on_ready():
         logger.info(f"Logged in as {bot.user}")
+        logger.info(f"Starting channel processing. Number of channels to process: {len(dev_channels)}")
+        logger.info(f"Channels to process: {dev_channels}")
         total_deleted = 0
         
         # First clean the summary channel
-        summary_channel = bot.get_channel(summary_channel_id)
-        if summary_channel:
-            deleted = await bot.clean_channel_and_threads(summary_channel)
-            total_deleted += deleted
-            logger.info(f"Finished cleaning summary channel #{summary_channel.name}: {deleted} messages deleted")
-        else:
-            logger.error(f"Could not find summary channel with ID: {summary_channel_id}")
+        try:
+            summary_channel = bot.get_channel(summary_channel_id)
+            if summary_channel:
+                logger.info(f"Processing summary channel: #{summary_channel.name}")
+                deleted = await bot.clean_channel_and_threads(summary_channel)
+                total_deleted += deleted
+                logger.info(f"Finished cleaning summary channel #{summary_channel.name}: {deleted} messages deleted")
+            else:
+                logger.error(f"Could not find summary channel with ID: {summary_channel_id}")
+        except Exception as e:
+            logger.error(f"Error processing summary channel: {e}")
         
         # Process each channel/category
-        for channel_id in dev_channels:
-            if channel_id:  # Skip empty strings
-                channel = bot.get_channel(int(channel_id))
+        for i, channel_id in enumerate(dev_channels, 1):
+            logger.info(f"Processing channel {i} of {len(dev_channels)}")
+            if not channel_id:  # Skip empty strings
+                logger.warning(f"Skipping empty channel ID at position {i}")
+                continue
+                
+            try:
+                channel_id_int = int(channel_id)
+                logger.info(f"Converting channel ID to int: {channel_id} -> {channel_id_int}")
+                channel = bot.get_channel(channel_id_int)
+                logger.info(f"Attempting to clean channel ID: {channel_id_int}")
+                
                 if not channel:
-                    logger.error(f"Could not find channel with ID: {channel_id}")
+                    logger.error(f"Could not find channel with ID: {channel_id_int}")
                     continue
                 
+                # Add permission check
+                permissions = channel.permissions_for(channel.guild.me)
+                logger.info(f"Bot permissions in channel #{channel.name}: manage_messages={permissions.manage_messages}")
+                if not permissions.manage_messages:
+                    logger.error(f"Bot lacks manage_messages permission in channel: #{channel.name}")
+                    continue
+                    
+                logger.info(f"Found channel: #{channel.name} (Type: {type(channel)})")
                 deleted = await bot.clean_channel_and_threads(channel)
                 total_deleted += deleted
-                if isinstance(channel, discord.CategoryChannel):
-                    logger.info(f"Finished cleaning category {channel.name}: {deleted} messages deleted")
-                else:
-                    logger.info(f"Finished cleaning channel #{channel.name}: {deleted} messages deleted")
+                logger.info(f"Finished processing channel {i} of {len(dev_channels)}: #{channel.name}")
+                
+            except ValueError as e:
+                logger.error(f"Invalid channel ID format at position {i}: '{channel_id}'")
+            except Exception as e:
+                logger.error(f"Error processing channel at position {i} ({channel_id}): {e}")
         
-        logger.info(f"Total messages deleted: {total_deleted}")
+        logger.info(f"Channel processing complete. Total messages deleted: {total_deleted}")
         
         # Properly close the session before shutting down
         await bot.http.close()

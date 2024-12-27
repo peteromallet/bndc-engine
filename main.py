@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from utils.log_handler import LogHandler
 import sys
 from utils.rate_limiter import RateLimiter
+import copy
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -40,12 +41,14 @@ class SummaryError(ChannelSummarizerError):
     pass
 
 class Attachment:
-    def __init__(self, filename: str, data: bytes, content_type: str, reaction_count: int, username: str):
+    def __init__(self, filename: str, data: bytes, content_type: str, reaction_count: int, username: str, content: str = "", jump_url: str = ""):
         self.filename = filename
         self.data = data
         self.content_type = content_type
         self.reaction_count = reaction_count
         self.username = username
+        self.content = content
+        self.jump_url = jump_url  # Add jump_url field
 
 class AttachmentHandler:
     def __init__(self, max_size: int = 25 * 1024 * 1024):
@@ -57,12 +60,15 @@ class AttachmentHandler:
         """Clear the attachment cache"""
         self.attachment_cache.clear()
         
-    async def process_attachment(self, attachment: discord.Attachment, message: discord.Message, session: aiohttp.ClientSession) -> Optional[Attachment]:
+    async def process_attachment(self, attachment: discord.Attachment, message: discord.Message, session: aiohttp.ClientSession, original_jump_url: str = None) -> Optional[Attachment]:
         """Process a single attachment with size and type validation."""
         try:
-            # Remove excessive debug logging
             cache_key = f"{message.channel.id}:{message.id}"
+            self.logger.debug(f"Processing attachment for cache key: {cache_key}")
             
+            # Use original_jump_url if provided (dev mode), otherwise use message.jump_url
+            jump_url = original_jump_url if original_jump_url else message.jump_url
+
             async with session.get(attachment.url, timeout=300) as response:
                 if response.status != 200:
                     raise APIError(f"Failed to download attachment: HTTP {response.status}")
@@ -73,23 +79,28 @@ class AttachmentHandler:
                     return None
 
                 total_reactions = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+                self.logger.debug(f"Attachment {attachment.filename} has {total_reactions} reactions")
 
                 processed_attachment = Attachment(
                     filename=attachment.filename,
                     data=file_data,
                     content_type=attachment.content_type,
                     reaction_count=total_reactions,
-                    username=message.author.name
+                    username=message.author.name,
+                    content=message.content,
+                    jump_url=jump_url  # Use the correct jump URL
                 )
 
+                # Ensure the cache key structure is consistent
                 if cache_key not in self.attachment_cache:
                     self.attachment_cache[cache_key] = {
                         'attachments': [],
                         'reaction_count': total_reactions,
                         'username': message.author.name,
-                        'channel_id': str(message.channel.id)
+                        'channel_id': str(message.channel.id)  # Ensure channel_id is stored as string
                     }
                 self.attachment_cache[cache_key]['attachments'].append(processed_attachment)
+                self.logger.debug(f"Successfully cached attachment {attachment.filename} for key {cache_key}")
 
                 return processed_attachment
 
@@ -170,7 +181,7 @@ class MessageFormatter:
             message_links = set(re.findall(r'https://discord\.com/channels/\d+/\d+/(\d+)', line))
             
             # Start new chunk if we hit emoji or length limit
-            if (any(line.startswith(emoji) for emoji in ['🎥', '💻', '🎬', '🤖', '📱', '💡', '🔧', '🎨', '📊']) and 
+            if (any(line.startswith(emoji) for emoji in ['🎥', '💻', '🎬', '🤖', '📱', '�������', '🔧', '🎨', '📊']) and 
                 current_chunk):
                 if current_chunk:
                     chunks.append((current_chunk, current_chunk_links))
@@ -257,7 +268,9 @@ class ChannelSummarizer(commands.Bot):
         self._summary_lock = asyncio.Lock()
         self._shutdown_flag = False
         self.current_summary_attachments = []
-
+        self.approved_channels = []
+        self.original_urls = {}  # Add this to store original URLs
+        
     def setup_logger(self, dev_mode):
         """Initialize or update logger configuration"""
         self.logger = self.log_handler.setup_logging(dev_mode)
@@ -386,20 +399,36 @@ class ChannelSummarizer(commands.Bot):
                 limit=100,
                 after=datetime.utcnow() - timedelta(days=1)
             ):
-                messages.append(message)
+                # Create a copy of the message with modified channel but preserve original URL
+                message_copy = copy.copy(message)
+                original_jump_url = message.jump_url  # Store original URL
+                message_copy.channel = self.get_channel(channel_id)  # Use the target channel
                 
-                # Process attachments
+                # Store both original URL and channel ID
+                self.original_urls[message_copy.id] = {
+                    'url': original_jump_url,
+                    'channel_id': str(channel_id)  # Use target channel ID instead of original
+                }
+                
+                messages.append(message_copy)
+                
+                # Process attachments with target channel info
                 if message.attachments:
                     async with aiohttp.ClientSession() as session:
                         for attachment in message.attachments:
+                            # Use target channel ID for cache key
                             processed = await self.attachment_handler.process_attachment(
-                                attachment, message, session
+                                attachment, 
+                                message_copy,  # Use modified message with target channel
+                                session,
+                                original_jump_url=original_jump_url
                             )
             
             self.logger.info(f"Loaded {len(messages)} messages from test data channel")
             return messages
         
         else:
+            # Production mode remains unchanged
             channel = self.get_channel(channel_id)
             if not channel:
                 raise DiscordError(f"Could not access channel {channel_id}")
@@ -412,6 +441,10 @@ class ChannelSummarizer(commands.Bot):
                 messages.append(message)
             
             return messages
+
+    def get_original_url(self, message_id: int) -> str:
+        """Get the original URL for a message ID"""
+        return self.original_urls.get(message_id, "")  # Return empty string if not found
 
     @handle_errors("get_claude_summary")
     async def get_claude_summary(self, messages):
@@ -426,9 +459,10 @@ class ChannelSummarizer(commands.Bot):
         
         try:
             # Build the conversation prompt
+            # Build the conversation prompt
             conversation = """Please summarize the interesting and noteworthy Discord happenings and ideas in bullet points. ALWAYS include Discord links and external links. You should extract ideas and information that may be useful to others from conversations. Avoid stuff like bug reports that are circumstantial or not useful to others. Break them into topics and sub-topics.
 
-If there's nothing significant or noteworthy in the messages, just respond with exactly "[NOTHING OF NOTE]" (and no other text). Always include external links and Discord links wherever possible.
+If there's nothing significant or noteworthy in the messages - if it's just casual discussion with no meaningful news just respond with exactly "[NOTHING OF NOTE]" (and no other text). Always include external links and Discord links wherever possible.
 
 Requirements:
 1. Make sure to ALWAYS include Discord links and external links 
@@ -470,17 +504,23 @@ Remember:
 4. You MUST ALWAYS use Discord's markdown format (not regular markdown)
 5. Keep most information at the top bullet level. Only use sub-points for direct supporting details
 6. Make topics clear headers with ##
+7. Remember: if there's nothing of note, just respond with "[NOTHING OF NOTE]" (and no other text).
 
 IMPORTANT: For each bullet point, use the EXACT message URL provided in the data - do not write <message_url> but instead use the actual URL from the message data.
 
 Please provide the summary now - don't include any other introductory text, ending text, or explanation of the summary:\n\n"""
-        
+
             for msg in messages:
                 timestamp = msg.created_at
                 author = msg.author.name
                 content = msg.content
                 reactions = sum(reaction.count for reaction in msg.reactions) if msg.reactions else 0
-                jump_url = msg.jump_url
+                
+                # Use original URL in dev mode, otherwise use current message URL
+                if self.dev_mode:
+                    jump_url = self.original_urls.get(msg.id, msg.jump_url)
+                else:
+                    jump_url = msg.jump_url
 
                 conversation += f"{timestamp} - {author}: {content}"
                 if reactions:
@@ -646,8 +686,19 @@ Full summary to work from:
         try:
             self.logger.info(f"Creating thread for message {message.id}, attempt 1")
             
-            # Only add "Detailed Summary" prefix if it's not a top generations thread
-            thread_name_with_prefix = thread_name if is_top_generations else f" Detailed Summary - {thread_name}"
+            # Format thread name based on type
+            if is_top_generations:
+                # Keep original name for top generations
+                thread_name_with_prefix = thread_name
+            else:
+                current_date = datetime.utcnow().strftime('%B %d, %Y')
+                
+                # For source/monthly thread, use month format
+                if thread_name.startswith('#'):
+                    thread_name_with_prefix = f"{datetime.utcnow().strftime('%b')} - {thread_name} Summary"
+                else:
+                    # For main summary thread, include channel name and date
+                    thread_name_with_prefix = f"Summary for {thread_name} - {current_date}"
             
             thread = await message.create_thread(
                 name=thread_name_with_prefix,
@@ -656,7 +707,7 @@ Full summary to work from:
             
             self.logger.info(f"Thread created successfully: {message.id} with name '{thread_name}'")
             return thread
-            
+                
         except Exception as e:
             self.logger.error(f"Error creating thread: {e}")
             self.logger.debug(traceback.format_exc())
@@ -722,200 +773,236 @@ Full summary to work from:
             self.logger.error(f"Failed to send topic chunk: {e}")
             self.logger.debug(traceback.format_exc())
 
-    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False) -> Tuple[Set[str], List[discord.File]]:
-        """Process and send a single topic to the thread. Returns used message IDs and files."""
+    async def process_topic(self, thread: discord.Thread, topic: str, is_first: bool = False, is_source_thread: bool = False) -> Tuple[Set[str], List[str]]:
+        """Process and send a single topic to the thread."""
         try:
             if not topic.strip():
                 return set(), []
-
-            # Format topic header
-            formatted_topic = ("---\n" if not is_first else "") + f"## {topic}"
+                
+            # Format topic header - remove the initial separator
+            formatted_topic = topic
             self.logger.info(f"Processing topic: {formatted_topic[:100]}...")
 
-            # Get message IDs from this chunk
-            chunk_message_ids = set(re.findall(r'https://discord\.com/channels/\d+/(\d+)/(\d+)', topic))
-            used_message_ids = set()
-            used_files_in_topic = set()  # Track files by filename within this topic only
+            # Split into header and bullet points
+            lines = topic.split('\n')
+            header = []
+            current_bullet = []
+            bullets = []
+            in_header = True
+            chunk_message_ids = set()
+            all_files = set()  # Use set to track used filenames
 
-            # Prepare files for just this chunk
-            chunk_files = []
-            for channel_id, message_id in chunk_message_ids:
-                cache_key = f"{channel_id}:{message_id}"
-                if cache_key in self.attachment_handler.attachment_cache:
-                    cache_data = self.attachment_handler.attachment_cache[cache_key]
+            # First pass - organize into header and bullets
+            for line in lines:
+                if line.strip().startswith('-'):
+                    if in_header:
+                        in_header = False
+                        # Add horizontal line with zero-width space if not first topic
+                        header = '\n'.join(header) if is_first else "---\n\u200B\n" + '\n'.join(header)
+                    if current_bullet:
+                        bullets.append(current_bullet)
+                    current_bullet = [line]
+                else:
+                    if in_header:
+                        header.append(line)
+                    elif current_bullet:
+                        current_bullet.append(line)
+
+            if current_bullet:
+                bullets.append(current_bullet)
+
+            # Send header first
+            if header:
+                await self.safe_send_message(thread, header)
+                await asyncio.sleep(1)
+
+            # Process each bullet point
+            for bullet in bullets:
+                try:
+                    bullet_text = '\n'.join(bullet)
+                    bullet_files = []
+                    
+                    # Find message IDs in this bullet point - simplified regex
+                    message_ids = re.findall(r'discord\.com/channels/\d+/\d+/(\d+)', bullet_text)
+                    
+                    if message_ids:  # Only process if we have message links
+                        self.logger.debug(f"Found message IDs in bullet: {message_ids}")
+                        
+                        # Get attachments for all message IDs in this bullet
+                        for message_id in message_ids:
+                            chunk_message_ids.add(message_id)
+                            
+                            # Search all cache keys for this message ID
+                            for cache_key in self.attachment_handler.attachment_cache:
+                                if cache_key.endswith(f":{message_id}"):
+                                    cache_data = self.attachment_handler.attachment_cache[cache_key]
+                                    self.logger.debug(f"Found cache data for message {message_id} with key {cache_key}: {cache_data}")
+                                    
+                                    for attachment in cache_data['attachments']:
+                                        try:
+                                            # Only skip if we've already used this exact file
+                                            if attachment.filename in all_files:
+                                                self.logger.debug(f"Skipping duplicate file: {attachment.filename}")
+                                                continue
+                                            
+                                            file = discord.File(
+                                                io.BytesIO(attachment.data),
+                                                filename=attachment.filename,
+                                                description=f"From message ID: {message_id} (🔥 {cache_data['reaction_count']} reactions)"
+                                            )
+                                            file_tuple = (
+                                                file,
+                                                cache_data['reaction_count'],
+                                                message_id,
+                                                cache_data['username']
+                                            )
+                                            bullet_files.append(file_tuple)
+                                            all_files.add(attachment.filename)
+                                            self.logger.debug(f"Added file {attachment.filename} to bullet point")
+                                        except Exception as e:
+                                            self.logger.error(f"Failed to prepare file: {e}")
+                                            continue
+
+                    # Send bullet point with its files
+                    if bullet_files:
+                        # Sort files by reaction count but include all of them
+                        bullet_files.sort(key=lambda x: x[1], reverse=True)
+                        
+                        # Format usernames for files
+                        usernames = [f"**{f[3]}**" for f in bullet_files]
+                        unique_usernames = []
+                        [unique_usernames.append(x) for x in usernames if x not in unique_usernames]
+                        
+                        if len(unique_usernames) > 1:
+                            formatted_usernames = f"{', '.join(unique_usernames[:-1])} and {unique_usernames[-1]}"
+                        else:
+                            formatted_usernames = unique_usernames[0]
+                                                                        
+                        # Log what we're about to send
+                        self.logger.debug(f"Sending bullet point with {len(bullet_files)} files")
+                        for f in bullet_files:
+                            self.logger.debug(f"- File: {f[0].filename} from {f[3]} with {f[1]} reactions")
+                        
+                        await self.safe_send_message(
+                            thread,
+                            bullet_text,
+                            files=[f[0] for f in bullet_files]
+                        )
+                    else:
+                        await self.safe_send_message(thread, bullet_text)
+                
+                except Exception as e:
+                    self.logger.error(f"Failed to send bullet point: {e}")
+                    self.logger.debug(traceback.format_exc())
+                    continue
+                
+                await asyncio.sleep(1)  # Prevent rate limiting
+
+            return chunk_message_ids, list(all_files)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing topic: {e}")
+            self.logger.debug(traceback.format_exc())
+            return set(), []
+
+    async def process_unused_attachments(self, thread, used_message_ids: Set[str], max_attachments: int = 10, 
+                                       previous_thread_id: Optional[str] = None, used_files: List[discord.File] = None,
+                                       is_source_thread: bool = False):
+        """Process and post any unused attachments from the channel."""
+        try:
+            # Track filenames that have been used
+            used_filenames = set()
+            if used_files:
+                for file in used_files:
+                    if isinstance(file, str):
+                        used_filenames.add(file)
+                    else:
+                        used_filenames.add(file.filename)
+
+            # Get unused attachments sorted by reaction count
+            unused_attachments = []
+            for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
+                channel_part, message_id = cache_key.split(":", 1)
+                
+                # Skip if message was already used or has low reactions
+                if message_id not in used_message_ids and cache_data['reaction_count'] >= 3:
                     for attachment in cache_data['attachments']:
                         try:
-                            # Only skip if this exact file was already used in this topic
-                            if attachment.filename in used_files_in_topic:
+                            # Skip if this file was already used
+                            if attachment.filename in used_filenames:
+                                self.logger.debug(f"Skipping already used file: {attachment.filename}")
                                 continue
                             
                             if len(attachment.data) <= 25 * 1024 * 1024:  # 25MB limit
                                 file = discord.File(
                                     io.BytesIO(attachment.data),
                                     filename=attachment.filename,
-                                    description=f"From {cache_data['username']} (🔥 {cache_data['reaction_count']} reactions)"
+                                    description=f"From {attachment.username} ( {attachment.reaction_count} reactions)"
                                 )
-                                chunk_files.append((
+                                unused_attachments.append((
                                     file,
-                                    cache_data['reaction_count'],
+                                    attachment.reaction_count,
                                     message_id,
-                                    cache_data['username']
+                                    attachment.username,
+                                    attachment.jump_url
                                 ))
-                                used_files_in_topic.add(attachment.filename)  # Track only within topic
+                                used_filenames.add(attachment.filename)
                         except Exception as e:
-                            self.logger.error(f"Failed to prepare file: {e}")
+                            self.logger.error(f"Failed to prepare unused attachment: {e}")
                             continue
 
-            # Sort files by reaction count and limit to top 10
-            chunk_files.sort(key=lambda x: x[1], reverse=True)
-            chunk_files = chunk_files[:10]
-
-            # Rest of the method remains the same...
-
-            # Send the chunk with its specific attachments
-            if chunk_files:
-                # Send content first
-                await self.safe_send_message(thread, formatted_topic)
+            if unused_attachments:
+                # Sort by reaction count
+                unused_attachments.sort(key=lambda x: x[1], reverse=True)
                 
-                # Then send each attachment individually
-                for file, reaction_count, message_id, username in chunk_files:
-                    try:
-                        await self.safe_send_message(
-                            thread,
-                            file=file
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Failed to send attachment: {e}")
-            else:
-                # If no attachments, just send the content
-                await self.safe_send_message(thread, formatted_topic)
+                # Limit attachments based on thread type
+                max_files = 3 if is_source_thread else max_attachments
+                unused_attachments = unused_attachments[:max_files]
+                
+                # Post header
+                await self.safe_send_message(thread, "\n\n---\n# 📎 Other Popular Attachments")
+                
+                # Post each attachment with both file and link
+                for file, reaction_count, message_id, username, jump_url in unused_attachments:
+                    message_content = f"By **{username}**: {jump_url}"
+                    await self.safe_send_message(thread, message_content, file=file)
 
-            return chunk_message_ids, used_files_in_topic
-
-        except Exception as e:
-            self.logger.error(f"Error processing topic: {e}")
-            self.logger.debug(traceback.format_exc())
-            return set(), []
-    
-    async def process_unused_attachments(self, thread: discord.Thread, used_message_ids: Set[str], max_attachments: int = 10, previous_thread_id: Optional[int] = None, used_files: Set[str] = None):
-        """Process and send unused but popular attachments."""
-        unused_attachments = []
-        
-        # used_files is now a set of filenames
-        used_filenames = used_files or set()
-        
-        # Get all attachments already in the thread
-        try:
-            async for message in thread.history(limit=None):
-                for attachment in message.attachments:
-                    used_filenames.add(attachment.filename)
-                    self.logger.debug(f"Adding existing thread attachment to used files: {attachment.filename}")
-        except Exception as e:
-            self.logger.error(f"Error getting thread history for attachment tracking: {e}")
-        
-        for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
-            channel_part, message_part = cache_key.split(":", 1)
-
-            # Skip if message was already used or if attachment was used as main image
-            if message_part not in used_message_ids and cache_data['reaction_count'] >= 3:
-                message_link = f"https://discord.com/channels/{self.guild_id}/{channel_part}/{message_part}"
-
-                for attachment in cache_data['attachments']:
-                    try:
-                        # Skip if this file was already used anywhere in the thread
-                        if attachment.filename in used_filenames:
-                            self.logger.debug(f"Skipping already used file: {attachment.filename}")
-                            continue
-                        
-                        if len(attachment.data) <= 25 * 1024 * 1024:  # 25MB limit
-                            file = discord.File(
-                                io.BytesIO(attachment.data),
-                                filename=attachment.filename,
-                                description=f"From {attachment.username} (🔥 {attachment.reaction_count} reactions)"
-                            )
-                            unused_attachments.append((
-                                file, 
-                                attachment.reaction_count,
-                                message_part,
-                                attachment.username,
-                                message_link
-                            ))
-                    except Exception as e:
-                        self.logger.error(f"Failed to prepare unused attachment: {e}")
-                        continue
-
-        if unused_attachments:
-            # Sort by reaction count
-            unused_attachments.sort(key=lambda x: x[1], reverse=True)
-            
-            # Post header
-            await self.safe_send_message(thread, "\n\n---\n# 📎 Other Popular Attachments")
-            
-            # Post each attachment individually with a message link (limited by max_attachments)
-            for file, reaction_count, message_id, username, message_link in unused_attachments[:max_attachments]:
-                message_content = f"By **{username}**: {message_link}"
-                await self.safe_send_message(thread, message_content, file=file)
-
-        # Add links to previous thread and current thread beginning
-        try:
-            footer_text = "\n---\n\u200B\n"
-
-            if previous_thread_id and str(previous_thread_id) != str(thread.id):  # Convert to strings for comparison
-                try:
-                    # Add more detailed logging
-                    self.logger.info(f"Attempting to fetch previous thread {previous_thread_id}")
-                    previous_thread = None
-                    
-                    # Try both fetch_channel and get_channel
-                    try:
-                        previous_thread = self.get_channel(previous_thread_id)
-                        if not previous_thread:
-                            previous_thread = await self.fetch_channel(previous_thread_id)
-                    except discord.NotFound:
-                        self.logger.warning(f"Could not find thread with ID {previous_thread_id}")
-                    
-                    if previous_thread and isinstance(previous_thread, discord.Thread):
-                        try:
-                            # Get first message of the thread for proper linking
-                            async for first_message in previous_thread.history(oldest_first=True, limit=1):
-                                thread_date = previous_thread.created_at.strftime('%B %Y')
-                                footer_text += (
-                                    f"**You can find a summary of this channel's activity from "
-                                    f"{thread_date} here:** {first_message.jump_url}\n\n"
-                                )
-                                self.logger.info(f"Successfully added link to previous thread from {thread_date}")
-                                break
-                        except discord.Forbidden:
-                            self.logger.error(f"Bot lacks permissions to access thread {previous_thread_id}")
-                        except discord.NotFound:
-                            self.logger.error(f"Thread {previous_thread_id} exists but cannot be accessed")
-                        except Exception as e:
-                            self.logger.error(f"Error creating previous thread link: {e}")
-                    else:
-                        self.logger.error(
-                            f"Retrieved channel is not a thread: {type(previous_thread)}"
-                            f" for ID {previous_thread_id}"
-                        )
-                        # Clear invalid thread ID from database
-                        self.db.update_summary_thread(thread.parent.id, None)
-                        self.logger.info(f"Cleared invalid thread ID {previous_thread_id} from database")
-                except Exception as e:
-                    self.logger.error(f"Error processing previous thread: {e}")
-                    self.logger.debug(traceback.format_exc())
-
-            # Add current thread jump link
+            # Always add navigation links, regardless of whether there were attachments
             try:
-                async for first_message in thread.history(oldest_first=True, limit=1):
-                    footer_text += f"***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
-                    await self.safe_send_message(thread, footer_text)
-                    self.logger.info("Successfully added thread navigation links")
-                    break
+                footer_text = "\n---\n\u200B\n"
+
+                if is_source_thread:  # If we're in the monthly/source thread
+                    # Only show one link - to the beginning of this thread
+                    async for first_message in thread.history(oldest_first=True, limit=1):
+                        footer_text += f"***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
+                        await self.safe_send_message(thread, footer_text)
+                        break
+                else:  # If we're in the main summary thread
+                    # Show both links - to monthly thread and to beginning of this thread
+                    if previous_thread_id and str(previous_thread_id) != str(thread.id):
+                        try:
+                            previous_thread = await self.fetch_channel(previous_thread_id)
+                            if previous_thread and isinstance(previous_thread, discord.Thread):
+                                async for first_message in previous_thread.history(oldest_first=True, limit=1):
+                                    thread_date = previous_thread.created_at.strftime('%B %Y')
+                                    footer_text += (
+                                        f"**Click here to jump to the beginning of this month's summary:** {first_message.jump_url}\n\n"
+                                    )
+                                    break
+                        except Exception as e:
+                            self.logger.error(f"Error processing previous thread: {e}")
+
+                    # Add current thread jump link
+                    async for first_message in thread.history(oldest_first=True, limit=1):
+                        footer_text += f"***Click here to jump to the beginning of today's summary: {first_message.jump_url}***"
+                        await self.safe_send_message(thread, footer_text)
+                        break
+
             except Exception as e:
-                self.logger.error(f"Failed to add thread jump link: {e}")
-                self.logger.debug(traceback.format_exc())
+                self.logger.error(f"Failed to add thread links: {e}")
 
         except Exception as e:
-            self.logger.error(f"Failed to add thread links: {e}")
+            self.logger.error(f"Error processing unused attachments: {e}")
             self.logger.debug(traceback.format_exc())
 
     async def post_summary(self, channel_id, summary: str, source_channel_name: str, message_count: int):
@@ -991,25 +1078,54 @@ Full summary to work from:
             # Generate short summary and handle main summary channel post
             short_summary = await self.generate_short_summary(summary, message_count)
             
-            # Get top attachment for initial message
-            all_files = self.attachment_handler.get_all_files_sorted()
-            top_attachment = all_files[0] if all_files else None
-            
+            # Get top attachment for initial message - MODIFIED THIS SECTION
             initial_file = None
-            if top_attachment:
+            all_files = []
+            
+            # First try channel-specific attachments
+            for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
+                try:
+                    channel_part, _ = cache_key.split(":", 1)
+                    # Convert both to integers for comparison to handle string/int mismatches
+                    if int(channel_part) == channel_id:  # Only look at attachments from this channel
+                        for attachment in cache_data['attachments']:
+                            # Add debug logging
+                            self.logger.debug(f"Found attachment {attachment.filename} in channel {channel_id}")
+                            if any(attachment.filename.lower().endswith(ext) 
+                                  for ext in ('.png', '.jpg', '.jpeg', '.gif', '.mp4', '.mov', '.webm')):
+                                all_files.append((
+                                    attachment,
+                                    cache_data.get('reaction_count', 0)  # Use get() with default
+                                ))
+                                self.logger.debug(f"Added {attachment.filename} to files list with {cache_data.get('reaction_count', 0)} reactions")
+                except (ValueError, AttributeError) as e:
+                    self.logger.error(f"Error processing cache key {cache_key}: {e}")
+                    continue
+
+            # Add debug logging
+            self.logger.debug(f"Found {len(all_files)} files for channel {channel_id}")
+
+            # Sort by reaction count and get top file
+            if all_files:
+                top_attachment, reaction_count = sorted(all_files, key=lambda x: x[1], reverse=True)[0]
+                self.logger.debug(f"Selected top attachment {top_attachment.filename} with {reaction_count} reactions")
                 initial_file = discord.File(
                     io.BytesIO(top_attachment.data),
                     filename=top_attachment.filename,
-                    description=f"🔥 {top_attachment.reaction_count} reactions"
+                    description=f"Most reacted media from channel (🔥 {reaction_count} reactions)"
                 )
-            
-            channel_mention = f"<#{source_channel.id}>"
+            else:
+                self.logger.debug(f"No attachments found for channel {channel_id}")
 
-            # Remove test mode check and use production channel directly
+            channel_mention = f"<#{source_channel.id}>"
             summary_channel = self.get_channel(self.summary_channel_id)
+            
+            # Add debug logging
+            self.logger.debug(f"Sending initial message to summary channel. Has file: {initial_file is not None}")
+            
             initial_message = await self.safe_send_message(
                 summary_channel,
-                f"## <#{source_channel.id}>\n{short_summary}",
+                f"## {channel_mention}\n{short_summary}",
                 file=initial_file
             )
 
@@ -1028,7 +1144,12 @@ Full summary to work from:
             await self.safe_send_message(thread, "# Detailed Summary")
 
             for i, topic in enumerate(topics):
-                topic_used_ids, topic_files = await self.process_topic(thread, topic, is_first=(i == 0))
+                topic_used_ids, topic_files = await self.process_topic(
+                    thread, 
+                    topic, 
+                    is_first=(i == 0),
+                    is_source_thread=False  # Main summary thread
+                )
                 used_message_ids.update(topic_used_ids)
                 used_files.extend(topic_files)  # Track files used in topics
                 
@@ -1036,7 +1157,8 @@ Full summary to work from:
                 thread, 
                 used_message_ids, 
                 previous_thread_id=existing_thread_id,
-                used_files=used_files  # Pass all used files
+                used_files=used_files,
+                is_source_thread=False  # Main summary thread
             )
 
             # Post to source channel thread (with limited attachments)
@@ -1058,12 +1180,23 @@ Full summary to work from:
 
             # Process topics for source thread
             for i, topic in enumerate(topics):
-                topic_used_ids, topic_files = await self.process_topic(source_thread, topic, is_first=(i == 0))
+                topic_used_ids, topic_files = await self.process_topic(
+                    source_thread, 
+                    topic, 
+                    is_first=(i == 0),
+                    is_source_thread=True  # Source channel thread
+                )
                 used_message_ids.update(topic_used_ids)
                 used_files.extend(topic_files)  # Track files used in topics
 
             # Only difference: limit attachments to 3 in the final section
-            await self.process_unused_attachments(source_thread, used_message_ids, max_attachments=3, previous_thread_id=existing_thread_id)
+            await self.process_unused_attachments(
+                source_thread, 
+                used_message_ids, 
+                max_attachments=3,
+                previous_thread_id=existing_thread_id,
+                is_source_thread=True  # Source channel thread
+            )
 
             # After posting the summary to the thread, notify the channel if it was an existing thread
             if thread_existed:
@@ -1073,10 +1206,60 @@ Full summary to work from:
                 await self.safe_send_message(source_channel, notification_message)
                 self.logger.info(f"Posted thread update notification to {source_channel.name}")
 
+            # Add footer with thread links
+            try:
+                footer_text = "\n---\n\u200B\n"
+
+                if existing_thread_id and str(existing_thread_id) != str(source_thread.id):
+                    try:
+                        self.logger.info(f"Attempting to fetch previous thread {existing_thread_id}")
+                        previous_thread = None
+                        
+                        try:
+                            previous_thread = self.get_channel(existing_thread_id)
+                            if not previous_thread:
+                                previous_thread = await self.fetch_channel(existing_thread_id)
+                        except discord.NotFound:
+                            self.logger.warning(f"Could not find thread with ID {existing_thread_id}")
+                        
+                        if previous_thread and isinstance(previous_thread, discord.Thread):
+                            try:
+                                async for first_message in previous_thread.history(oldest_first=True, limit=1):
+                                    thread_date = previous_thread.created_at.strftime('%B %Y')
+                                    footer_text += (
+                                        f"**You can find a summary of this channel's activity from "
+                                        f"{thread_date} here:** {first_message.jump_url}\n\n"
+                                    )
+                                    break
+                            except Exception as e:
+                                self.logger.error(f"Error creating previous thread link: {e}")
+                        else:
+                            self.logger.error(
+                                f"Retrieved channel is not a thread: {type(previous_thread)}"
+                                f" for ID {existing_thread_id}"
+                            )
+                            # Clear invalid thread ID from database
+                            self.db.update_summary_thread(source_thread.parent.id, None)
+                    except Exception as e:
+                        self.logger.error(f"Error processing previous thread: {e}")
+
+                # Add current thread jump link
+                try:
+                    async for first_message in source_thread.history(oldest_first=True, limit=1):
+                        footer_text += f"***Click here to jump to the beginning of this thread: {first_message.jump_url}***"
+                        await self.safe_send_message(source_thread, footer_text)
+                        self.logger.info("Successfully added thread navigation links")
+                        break
+                except Exception as e:
+                    self.logger.error(f"Failed to add thread jump link: {e}")
+
+            except Exception as e:
+                self.logger.error(f"Failed to add thread links: {e}")
+                self.logger.debug(traceback.format_exc())
+
         except Exception as e:
             self.logger.error(f"Error in post_summary: {e}")
             self.logger.debug(traceback.format_exc())
-            raise
 
     async def generate_summary(self):
         if self._summary_lock.locked():
@@ -1165,12 +1348,20 @@ Full summary to work from:
                         # Store attachments from this channel
                         for message in messages:
                             if message.attachments:
-                                self.current_summary_attachments.append({
-                                    'message': message,
-                                    'channel': channel,
-                                    'attachments': message.attachments,
-                                    'reaction_count': sum(r.count for r in message.reactions) if message.reactions else 0
-                                })
+                                self.logger.debug(f"Processing {len(message.attachments)} attachments from message {message.id}")
+                                async with aiohttp.ClientSession() as session:
+                                    for attachment in message.attachments:
+                                        try:
+                                            processed = await self.attachment_handler.process_attachment(
+                                                attachment, message, session
+                                            )
+                                            if processed:
+                                                self.logger.debug(f"Successfully processed attachment {attachment.filename}")
+                                            else:
+                                                self.logger.debug(f"Failed to process attachment {attachment.filename}")
+                                        except Exception as e:
+                                            self.logger.error(f"Error processing attachment: {e}")
+                                            continue
                         
                         # Process messages for caching attachments regardless of channel type
                         if len(messages) >= 10:
@@ -1250,7 +1441,6 @@ Full summary to work from:
                     footer_text = f"""---
 
 **_Click here to jump to the top of today's summary:_** {self.first_message.jump_url}"""
-
                     await self.safe_send_message(summary_channel, footer_text)
                     self.logger.info("Footer message added to summary channel")
                 else:
@@ -1415,102 +1605,86 @@ Full summary to work from:
             
             # Get the correct channel to monitor in dev mode
             if self.dev_mode:
-                test_channel_id = int(os.getenv('TEST_DATA_CHANNEL'))
-                self.logger.info(f"Using test data channel {test_channel_id} for development")
-                monitored_channels = [test_channel_id]  # Only monitor test channel in dev mode
+                # CHANGE: Fix the channel ID extraction from cache keys
+                monitored_channels = list(set(
+                    int(cache_key.split(':')[0])  # Only take the channel ID part before the colon
+                    for cache_key in self.attachment_handler.attachment_cache.keys()
+                ))
+                
+                self.logger.info(f"Using cached channels in dev mode: {monitored_channels}")
+                
+                # Don't update channels_to_monitor in dev mode
+                self.approved_channels = monitored_channels  # Allow all channels with cached attachments
+                
             else:
                 monitored_channels = [int(chan) for chan in self.channels_to_monitor]
             
             self.logger.info(f"Monitoring channels: {monitored_channels}")
+            self.logger.debug(f"Approved channels: {self.approved_channels}")
             
             # Get all video attachments from stored attachments
             video_attachments = []
-            self.logger.info(f"Processing {len(self.current_summary_attachments)} stored attachments")
+            seen_videos = set()  # Track unique videos by filename + username
             
-            # Track all videos separately from other attachments
-            for item in self.current_summary_attachments:
-                channel = item['channel']
-                message = item['message']
-                
-                # Skip if channel not in monitored list
-                if isinstance(channel, discord.TextChannel):
-                    channel_id = channel.id
-                else:  # Handle dict case for test data
-                    channel_id = channel.get('id') or int(os.getenv('TEST_DATA_CHANNEL'))
-                    
-                if channel_id not in monitored_channels:
-                    self.logger.debug(f"Skipping channel {channel_id} - not in monitored list")
-                    continue
-                    
-                # Skip if channel name contains 'support'
-                if 'support' in channel.name.lower():
-                    continue
-                    
-                for attachment in item['attachments']:
-                    # More lenient video check
-                    is_video = (attachment.content_type and 
-                               ('video' in attachment.content_type.lower()))
-                    
-                    if is_video:
-                        reaction_count = sum(r.count for r in message.reactions) if message.reactions else 0
-                        self.logger.info(f"Found video in {channel.name} with {reaction_count} reactions")
-                        
-                        # Get unique reactors
-                        unique_reactors = set()
-                        for reaction in message.reactions:
-                            async for user in reaction.users():
-                                unique_reactors.add(user.id)
-                        
-                        if len(unique_reactors) > 3:
-                            video_attachments.append({
-                                'message': message,
-                                'attachment': attachment,
-                                'channel_name': channel.name,
-                                'reaction_count': reaction_count,
-                                'unique_reactors': len(unique_reactors),
-                                'username': message.author.name
-                            })
-                            self.logger.info(f"Added video to top generations list")
-
-            # Process cached attachments as well
+            # Track all videos from the attachment cache
             for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
-                channel_id, message_id = cache_key.split(":")
-                channel = self.get_channel(int(channel_id))
-                
-                if not channel or channel_id not in monitored_channels:
-                    continue
+                try:
+                    channel_id = int(cache_key.split(':')[0])
                     
-                if 'support' in channel.name.lower():
-                    continue
-                    
-                for attachment in cache_data['attachments']:
-                    if any(attachment.filename.lower().endswith(ext) 
-                          for ext in ('.mp4', '.mov', '.webm', '.avi')):
-                        try:
-                            message = await channel.fetch_message(int(message_id))
-                            unique_reactors = set()
-                            for reaction in message.reactions:
-                                async for user in reaction.users():
-                                    unique_reactors.add(user.id)
-                            
-                            if len(unique_reactors) > 3:
-                                video_attachments.append({
-                                    'message': message,
-                                    'attachment': attachment,
-                                    'channel_name': channel.name,
-                                    'reaction_count': len(unique_reactors),
-                                    'username': cache_data['username'],
-                                    'unique_reactors': len(unique_reactors)
-                                })
-                        except Exception as e:
-                            self.logger.error(f"Error processing cached video: {e}")
+                    # CHANGE: In dev mode, accept all channels that have cached attachments
+                    if self.dev_mode:
+                        channel = self.get_channel(channel_id)
+                        if not channel:
+                            continue
+                        
+                        # Skip if channel name contains 'support' or 'art'
+                        if any(term in channel.name.lower() for term in ['support', 'art']):
+                            continue
+                    else:
+                        # Production mode checks
+                        if channel_id not in monitored_channels:
+                            self.logger.debug(f"Skipping channel {channel_id} - not in monitored list")
+                            continue
+                        
+                        if channel_id not in self.approved_channels:
+                            self.logger.debug(f"Skipping channel {channel_id} - not in approved list")
+                            continue
+                        
+                        channel = self.get_channel(channel_id)
+                        if not channel:
+                            continue
+                        
+                        if 'support' in channel.name.lower():
                             continue
 
-            # Sort by unique reactor count
-            video_attachments.sort(key=lambda x: x['unique_reactors'], reverse=True)
-            
-            # Take top 10 but include ALL videos that meet criteria
-            top_generations = video_attachments[:10]
+                    for attachment in cache_data['attachments']:
+                        # Create a unique identifier for this video
+                        video_id = f"{attachment.filename}:{cache_data['username']}"
+                        
+                        # Skip if we've already seen this video from this user
+                        if video_id in seen_videos:
+                            self.logger.debug(f"Skipping duplicate video: {video_id}")
+                            continue
+                        
+                        # More lenient video check
+                        is_video = any(attachment.filename.lower().endswith(ext) 
+                                     for ext in ('.mp4', '.mov', '.webm', '.avi'))
+                        
+                        if is_video and cache_data['reaction_count'] >= 3:
+                            self.logger.info(f"Found video in {channel.name} with {cache_data['reaction_count']} reactions")
+                            
+                            video_attachments.append({
+                                'attachment': attachment,
+                                'channel_name': channel.name,
+                                'reaction_count': cache_data['reaction_count'],
+                                'username': cache_data['username']
+                            })
+                            seen_videos.add(video_id)  # Mark this video as seen
+                            self.logger.info(f"Added video to top generations list")
+
+                except Exception as e:
+                    self.logger.error(f"Error processing cache key {cache_key}: {e}")
+                    continue
 
             # Rest of the method remains the same...
 
@@ -1520,7 +1694,7 @@ Full summary to work from:
                 return
             
             # Sort by unique reactor count
-            video_attachments.sort(key=lambda x: x['unique_reactors'], reverse=True)
+            video_attachments.sort(key=lambda x: x['reaction_count'], reverse=True)
             
             # Take top 10 but include ALL videos that meet criteria
             top_generations = video_attachments[:10]
@@ -1529,7 +1703,7 @@ Full summary to work from:
 
             # Get the top generation for the header message
             top_gen = top_generations[0]
-            top_message = top_gen['message'].content[:100] + "..." if len(top_gen['message'].content) > 100 else top_gen['message'].content
+            top_message = top_gen['attachment'].content[:100] + "..." if len(top_gen['attachment'].content) > 100 else top_gen['attachment'].content
             
             # Create dynamic header based on number of generations
             header_title = (
@@ -1541,7 +1715,7 @@ Full summary to work from:
             header_content = [
                 f"# {header_title}\n\n"                
                 f"## 1. By **{top_gen['username']}** in {top_gen['channel_name']}\n"
-                f"🔥 {top_gen['unique_reactors']} unique reactions\n"
+                f"🔥 {top_gen['reaction_count']} unique reactions\n"
             ]
             
             # Only add message text if it's not empty
@@ -1549,7 +1723,7 @@ Full summary to work from:
                 header_content.append(f"💭 Message text: `{top_message}`\n")
             
             # Add plain URL link
-            header_content.append(f"🔗 {top_gen['message'].jump_url}")
+            header_content.append(f"🔗 {top_gen['attachment'].jump_url}")
             
             # Join all content parts
             header_content = ''.join(header_content)
@@ -1558,7 +1732,7 @@ Full summary to work from:
             file = discord.File(
                 io.BytesIO(top_gen['attachment'].data),
                 filename=top_gen['attachment'].filename,
-                description=f"Top Generation - {top_gen['unique_reactors']} unique reactions"
+                description=f"Top Generation - {top_gen['reaction_count']} unique reactions"
             )
             
             self.logger.info("Creating initial thread message with top generation")
@@ -1580,19 +1754,18 @@ Full summary to work from:
             for i, gen in enumerate(top_generations[1:], 2):
                 try:
                     attachment = gen['attachment']
-                    message = gen['message']
                     channel_name = gen['channel_name']
                     
                     # Create message link
-                    message_link = message.jump_url
+                    message_link = attachment.jump_url
                     
                     # Get message content (first 100 chars)
-                    msg_text = message.content[:100] + "..." if len(message.content) > 100 else message.content
+                    msg_text = attachment.content[:100] + "..." if len(attachment.content) > 100 else attachment.content
                     
                     # Build description content
                     description = [
-                        f"## {i}. By **{gen['username']}** in #{gen['channel_name']}\n"
-                        f"🔥 {gen['unique_reactors']} unique reactions\n"
+                        f"## {i}. By **{gen['username']}** in #{channel_name}\n"
+                        f"🔥 {gen['reaction_count']} unique reactions\n"
                     ]
                     
                     # Only add message text if it's not empty
@@ -1608,7 +1781,7 @@ Full summary to work from:
                     file = discord.File(
                         io.BytesIO(attachment.data),
                         filename=attachment.filename,
-                        description=f"#{i} - {gen['unique_reactors']} unique reactions"
+                        description=f"#{i} - {gen['reaction_count']} unique reactions"
                     )
 
                     await self.safe_send_message(thread, description, file=file)
@@ -1676,34 +1849,35 @@ Full summary to work from:
             
             if top_art and max_unique_reactors > 0:
                 self.logger.info(f"Found top art with {max_unique_reactors} reactions")
-                # Get the first attachment
-                file = await top_art.attachments[0].to_file()
                 
-                # Format the message differently based on mode
-                content = [f"# Top <#{art_channel.id}>  Post Today", ""]  # Start with title and empty line
-                
-                # Always include author, but format differently based on mode
-                if self.dev_mode:
-                    content.append(f"By: **{top_art.author.name}**")  # Just bold the name in dev mode
-                else:
-                    content.append(f"By: <@{top_art.author.id}>")  # Tag the user in production mode
-                
-                # Add comment if there is one (in both modes)
-                if top_art.content:
-                    content.append(f"💭 *\"{top_art.content}\"*")  # Add emoji and italics for the quote
-                
-                # Add links (in both modes)
-                content.append(f"{top_art.jump_url}")
-                
-                # Join with newlines
-                formatted_content = "\n".join(content)
-                
-                await self.safe_send_message(
-                    summary_channel,
-                    formatted_content,
-                    file=file
-                )
-                self.logger.info("Posted top art share successfully")
+                try:
+                    # Get the first attachment URL
+                    attachment_url = top_art.attachments[0].url
+                    
+                    # Format the message content
+                    content = [
+                        f"# Top <#{art_channel.id}> Post Today",
+                        "",  # Empty line for spacing
+                        f"By: **{top_art.author.name}**" if self.dev_mode else f"By: <@{top_art.author.id}>"
+                    ]
+                    
+                    # Add comment if there is one
+                    if top_art.content:
+                        content.append(f"💭 *\"{top_art.content}\"*")
+                    
+                    # Add attachment URL and jump link
+                    content.append(f"{attachment_url}")  # Direct attachment URL
+                    content.append(f"🔗 Original post: {top_art.jump_url}")
+                    
+                    # Join with newlines and send as one message
+                    formatted_content = "\n".join(content)
+                    await self.safe_send_message(summary_channel, formatted_content)
+                    self.logger.info("Posted top art share successfully")
+
+                except Exception as e:
+                    self.logger.error(f"Error handling art post: {e}")
+                    self.logger.debug(traceback.format_exc())
+
             else:
                 self.logger.info("No art posts with reactions found in the last 24 hours")
 
@@ -1858,3 +2032,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
