@@ -1,3 +1,8 @@
+import os
+import sys
+# Add project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import sqlite3
 import logging
 from typing import List, Set, Dict
@@ -26,8 +31,11 @@ def get_desired_schema() -> List[tuple]:
         ("id", "BIGINT PRIMARY KEY"),
         ("message_id", "BIGINT"),
         ("channel_id", "BIGINT"),
+        ("channel_name", "TEXT"),
         ("author_id", "BIGINT"),
         ("author_name", "TEXT"),
+        ("author_discriminator", "TEXT"),
+        ("author_avatar_url", "TEXT"),
         ("content", "TEXT"),
         ("created_at", "TEXT"),
         ("attachments", "TEXT"),
@@ -39,6 +47,7 @@ def get_desired_schema() -> List[tuple]:
         ("thread_id", "BIGINT"),
         ("message_type", "TEXT"),
         ("flags", "INTEGER"),
+        ("jump_url", "TEXT"),
         ("indexed_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     ]
 

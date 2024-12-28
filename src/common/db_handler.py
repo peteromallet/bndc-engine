@@ -2,7 +2,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 from .constants import DATABASE_PATH
 
@@ -36,8 +36,11 @@ class DatabaseHandler:
                     id BIGINT PRIMARY KEY,
                     message_id BIGINT,
                     channel_id BIGINT,
+                    channel_name TEXT,
                     author_id BIGINT,
                     author_name TEXT,
+                    author_discriminator TEXT,
+                    author_avatar_url TEXT,
                     content TEXT,
                     created_at TEXT,
                     attachments TEXT,
@@ -49,6 +52,7 @@ class DatabaseHandler:
                     thread_id BIGINT,
                     message_type TEXT,
                     flags INTEGER,
+                    jump_url TEXT,
                     indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -119,21 +123,43 @@ class DatabaseHandler:
 
     # Message Archive Methods
     def store_messages(self, messages: List[Dict]):
-        """Store messages in database."""
+        """Store messages in database, skipping duplicates."""
         try:
-            for message in messages:
+            # First check which messages already exist
+            message_ids = [msg['message_id'] for msg in messages]
+            placeholders = ','.join('?' * len(message_ids))
+            
+            self.cursor.execute(f"""
+                SELECT message_id 
+                FROM messages 
+                WHERE message_id IN ({placeholders})
+            """, message_ids)
+            
+            existing_ids = {row[0] for row in self.cursor.fetchall()}
+            new_messages = [msg for msg in messages if msg['message_id'] not in existing_ids]
+            
+            if not new_messages:
+                logger.debug("No new messages to store - all messages already exist")
+                return
+            
+            # Insert only new messages
+            for message in new_messages:
                 self.cursor.execute("""
-                    INSERT OR IGNORE INTO messages 
-                    (id, message_id, channel_id, author_id, author_name, content, created_at, 
+                    INSERT INTO messages 
+                    (id, message_id, channel_id, channel_name, author_id, author_name, 
+                     author_discriminator, author_avatar_url, content, created_at, 
                      attachments, embeds, reactions, reference_id, edited_at,
-                     is_pinned, thread_id, message_type, flags)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     is_pinned, thread_id, message_type, flags, jump_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     message['id'],
                     message['message_id'],
                     message['channel_id'],
+                    message.get('channel_name'),
                     message['author_id'],
                     message['author_name'],
+                    message.get('author_discriminator'),
+                    message.get('author_avatar_url'),
                     message['content'],
                     message['created_at'],
                     json.dumps(message['attachments']),
@@ -144,7 +170,8 @@ class DatabaseHandler:
                     message['is_pinned'],
                     message['thread_id'],
                     message['message_type'],
-                    message['flags']
+                    message['flags'],
+                    message.get('jump_url')
                 ))
                 
                 # Update FTS index
@@ -155,6 +182,7 @@ class DatabaseHandler:
                     """, (message['id'], message['content']))
             
             self.conn.commit()
+            logger.debug(f"Stored {len(new_messages)} new messages (skipped {len(existing_ids)} duplicates)")
             
         except Exception as e:
             logger.error(f"Error storing messages: {e}")
@@ -306,3 +334,46 @@ class DatabaseHandler:
                 self.conn.close()
         except Exception as e:
             logger.error(f"Error closing database connection: {e}")
+
+    def get_all_message_ids(self, channel_id: int) -> List[int]:
+        """Get all message IDs that have been archived for a channel."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT message_id FROM messages WHERE channel_id = ?",
+            (channel_id,)
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_message_date_range(self, channel_id: int) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """Get the earliest and latest message dates for a channel."""
+        try:
+            self.cursor.execute("""
+                SELECT MIN(created_at), MAX(created_at)
+                FROM messages 
+                WHERE channel_id = ?
+            """, (channel_id,))
+            result = self.cursor.fetchone()
+            
+            if result and result[0] and result[1]:
+                return (
+                    datetime.fromisoformat(result[0]),
+                    datetime.fromisoformat(result[1])
+                )
+            return None, None
+        except Exception as e:
+            logger.error(f"Error getting message date range: {e}")
+            return None, None
+
+    def get_message_dates(self, channel_id: int) -> List[str]:
+        """Get all message dates for a channel to check for gaps."""
+        try:
+            self.cursor.execute("""
+                SELECT created_at
+                FROM messages 
+                WHERE channel_id = ?
+                ORDER BY created_at
+            """, (channel_id,))
+            return [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting message dates: {e}")
+            return []

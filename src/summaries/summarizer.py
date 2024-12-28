@@ -232,7 +232,7 @@ class MessageFormatter:
         return chunks
 
 class ChannelSummarizer(commands.Bot):
-    def __init__(self):
+    def __init__(self, logger=None):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
@@ -249,7 +249,7 @@ class ChannelSummarizer(commands.Bot):
         )
         
         self._dev_mode = None
-        self.logger = None
+        self.logger = logger or logging.getLogger(__name__)
         self.log_handler = LogHandler(
             logger_name='ChannelSummarizer',
             prod_log_file='discord_bot.log',
@@ -1930,41 +1930,6 @@ Full summary to work from:
             self.logger.debug(traceback.format_exc())
             # Still try to close parent even if we had an error
             await super().close()
-
-async def schedule_daily_summary(bot):
-    """
-    Run daily summaries on schedule. Only exits if there's an error or explicit shutdown.
-    """
-    try:
-        while not bot._shutdown_flag:  # Add loop to keep running
-            now = datetime.utcnow()
-            target = now.replace(hour=10, minute=0, second=0, microsecond=0)
-            
-            if now.hour >= 10:
-                target += timedelta(days=1)
-            
-            delay = (target - now).total_seconds()
-            bot.logger.info(f"Waiting {delay/3600:.2f} hours until next summary at {target} UTC")
-            
-            try:
-                await asyncio.sleep(delay)
-                await bot.generate_summary()
-                bot.logger.info(f"Summary generated successfully at {datetime.utcnow()} UTC")
-            except asyncio.CancelledError:
-                bot.logger.info("Summary schedule cancelled - shutting down")
-                break
-            except Exception as e:
-                bot.logger.error(f"Error generating summary: {e}")
-                bot.logger.debug(traceback.format_exc())
-                # Wait 1 hour before retrying on error
-                await asyncio.sleep(3600)
-                
-    except Exception as e:
-        bot.logger.error(f"Fatal error in scheduler: {e}")
-        bot.logger.debug(traceback.format_exc())
-        bot._shutdown_flag = True  # Signal shutdown on fatal error
-        await bot.close()
-        raise
 
 def main():
     # Parse command line arguments FIRST
