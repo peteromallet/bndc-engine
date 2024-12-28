@@ -33,6 +33,7 @@ env/
 # Logs
 *.log
 logs/
+archive_discord.log
 
 # db
 *.db
@@ -43,3 +44,17 @@ cache/
 # Log files
 discord_bot_dev.log*
 discord_bot.log*
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Local development
+local_settings.py
+*.local
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

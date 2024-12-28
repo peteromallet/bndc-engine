@@ -20,7 +20,7 @@ discord_logger.setLevel(logging.WARNING)
 # Add parent directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.db_handler import DatabaseHandler
+from src.common.db_handler import DatabaseHandler
 
 class ChannelCleaner(commands.Bot):
     def __init__(self):
@@ -31,6 +31,7 @@ class ChannelCleaner(commands.Bot):
         
         super().__init__(command_prefix="!", intents=intents)
         self.db = DatabaseHandler()
+        self.target_user_id = 301463647895683072  # Add this line to store the target user ID
         
     async def delete_database_entries(self, channel_id: int):
         """Delete all database entries for a channel."""
@@ -73,20 +74,20 @@ class ChannelCleaner(commands.Bot):
         deleted_count = 0
         
         try:
-            # Add logging for initial message check
+            # Modified logging for initial message check
             logger.info(f"Starting message deletion in channel: #{channel.name}")
             
-            # First check if there are any deletable messages
+            # Check for deletable messages from both bot and target user
             has_deletable_messages = False
             message_count = 0
-            bot_message_count = 0
+            deletable_message_count = 0
             async for message in channel.history(limit=None):
                 message_count += 1
-                if message.author.id == self.user.id:
+                if message.author.id in [self.user.id, self.target_user_id]:
                     has_deletable_messages = True
-                    bot_message_count += 1
+                    deletable_message_count += 1
             
-            logger.info(f"Channel #{channel.name} has {message_count} total messages, {bot_message_count} from bot")
+            logger.info(f"Channel #{channel.name} has {message_count} total messages, {deletable_message_count} deletable messages")
             
             if not has_deletable_messages:
                 if isinstance(channel, discord.Thread):
@@ -98,7 +99,8 @@ class ChannelCleaner(commands.Bot):
             while True:
                 messages = []
                 async for message in channel.history(limit=None):
-                    if message.author.id == self.user.id:
+                    # Modified to check for both bot and target user messages
+                    if message.author.id in [self.user.id, self.target_user_id]:
                         messages.append(message)
                 
                 if not messages:
@@ -195,20 +197,16 @@ async def main():
     # Load environment variables
     load_dotenv()
     
-    # Hardcode channels for testing
-    dev_channels = ['1320120559425818655', '1320122436703752252']
-    logger.info(f"Using hardcoded channel IDs: {dev_channels}")
+    # Hardcode category ID for testing
+    dev_category_id = '1320120516954034186'
+    logger.info(f"Using hardcoded category ID: {dev_category_id}")
     
     bot_token = os.getenv('DISCORD_BOT_TOKEN')
     summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
     
-    # Remove the environment variable parsing since we're using hardcoded values
-    
     @bot.event
     async def on_ready():
         logger.info(f"Logged in as {bot.user}")
-        logger.info(f"Starting channel processing. Number of channels to process: {len(dev_channels)}")
-        logger.info(f"Channels to process: {dev_channels}")
         total_deleted = 0
         
         # First clean the summary channel
@@ -224,41 +222,25 @@ async def main():
         except Exception as e:
             logger.error(f"Error processing summary channel: {e}")
         
-        # Process each channel/category
-        for i, channel_id in enumerate(dev_channels, 1):
-            logger.info(f"Processing channel {i} of {len(dev_channels)}")
-            if not channel_id:  # Skip empty strings
-                logger.warning(f"Skipping empty channel ID at position {i}")
-                continue
-                
-            try:
-                channel_id_int = int(channel_id)
-                logger.info(f"Converting channel ID to int: {channel_id} -> {channel_id_int}")
-                channel = bot.get_channel(channel_id_int)
-                logger.info(f"Attempting to clean channel ID: {channel_id_int}")
-                
-                if not channel:
-                    logger.error(f"Could not find channel with ID: {channel_id_int}")
-                    continue
-                
-                # Add permission check
-                permissions = channel.permissions_for(channel.guild.me)
-                logger.info(f"Bot permissions in channel #{channel.name}: manage_messages={permissions.manage_messages}")
-                if not permissions.manage_messages:
-                    logger.error(f"Bot lacks manage_messages permission in channel: #{channel.name}")
-                    continue
-                    
-                logger.info(f"Found channel: #{channel.name} (Type: {type(channel)})")
-                deleted = await bot.clean_channel_and_threads(channel)
+        # Process the category
+        try:
+            category_id_int = int(dev_category_id)
+            category = bot.get_channel(category_id_int)
+            
+            if not category:
+                logger.error(f"Could not find category with ID: {category_id_int}")
+            else:
+                logger.info(f"Processing category: {category.name}")
+                deleted = await bot.clean_channel_and_threads(category)
                 total_deleted += deleted
-                logger.info(f"Finished processing channel {i} of {len(dev_channels)}: #{channel.name}")
+                logger.info(f"Finished processing category: {category.name}")
                 
-            except ValueError as e:
-                logger.error(f"Invalid channel ID format at position {i}: '{channel_id}'")
-            except Exception as e:
-                logger.error(f"Error processing channel at position {i} ({channel_id}): {e}")
+        except ValueError as e:
+            logger.error(f"Invalid category ID format: '{dev_category_id}'")
+        except Exception as e:
+            logger.error(f"Error processing category: {e}")
         
-        logger.info(f"Channel processing complete. Total messages deleted: {total_deleted}")
+        logger.info(f"Category processing complete. Total messages deleted: {total_deleted}")
         
         # Properly close the session before shutting down
         await bot.http.close()
