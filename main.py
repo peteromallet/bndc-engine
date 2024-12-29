@@ -6,6 +6,7 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import traceback
+import time
 
 from src.summaries.summarizer import ChannelSummarizer
 
@@ -19,6 +20,12 @@ def setup_logging(dev_mode=False):
     )
     return logging.getLogger('DiscordBot')
 
+# Add at top of file
+MAX_RETRIES = 3
+READY_TIMEOUT = 60
+INITIAL_RETRY_DELAY = 3600  # 1 hour
+MAX_RETRY_WAIT = 24 * 3600  # 24 hours in seconds
+
 async def run_bot(bot, token, run_now):
     """Run the bot with optional immediate summary generation"""
     try:
@@ -26,27 +33,22 @@ async def run_bot(bot, token, run_now):
         bot_task = asyncio.create_task(bot.start(token))
         
         # Wait for bot to be ready
+        start_time = time.time()
         while not bot.is_ready():
+            if time.time() - start_time > READY_TIMEOUT:
+                raise TimeoutError("Bot failed to become ready within timeout period")
             await asyncio.sleep(1)
             
         bot.logger.info("Bot is ready and fully connected")
             
         if run_now:
             bot.logger.info("Running immediate summary...")
-            # Wait a moment for the bot to fully connect
-            await asyncio.sleep(2)
-            # Trigger immediate summary processing
+            await asyncio.sleep(2)  # Extra sleep
             await bot.generate_summary()
-            # Signal shutdown after summary completes
-            bot._shutdown_flag = True
-            # Close the bot connection
+            bot._shutdown_flag = True  # Immediately shutdown after
             await bot.close()
-            # Cancel the bot task
             bot_task.cancel()
-            try:
-                await bot_task
-            except asyncio.CancelledError:
-                pass
+            await cleanup_tasks([bot_task])
         else:
             bot.logger.info("Starting scheduled mode...")
             # Create and start the scheduler task
@@ -59,16 +61,10 @@ async def run_bot(bot, token, run_now):
             )
             
             # Cancel any pending tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            await cleanup_tasks(pending)
             
     except Exception as e:
         bot.logger.error(f"Error running bot: {e}")
-        import traceback
         traceback.print_exc()
         sys.exit(1)
 
@@ -78,35 +74,54 @@ async def schedule_daily_summary(bot):
     """
     try:
         while not bot._shutdown_flag:
+            retry_count = 0  # Reset retry count for each day's attempt
+            # Get current UTC time
             now = datetime.utcnow()
+            
+            # Set target time to 10:00 UTC today
             target = now.replace(hour=10, minute=0, second=0, microsecond=0)
             
+            # If it's already past 10:00 UTC today, schedule for tomorrow
             if now.hour >= 10:
                 target += timedelta(days=1)
             
+            # Calculate how long to wait
             delay = (target - now).total_seconds()
             bot.logger.info(f"Scheduler: Waiting {delay/3600:.2f} hours until next summary at {target} UTC")
             
+            # Wait until the target time
             try:
                 await asyncio.sleep(delay)
                 if not bot._shutdown_flag:
-                    bot.logger.info("Scheduler: Starting daily summary generation")
                     await bot.generate_summary()
-                    bot.logger.info(f"Scheduler: Summary generated successfully at {datetime.utcnow()} UTC")
+                    # Success - clear retry count
+                    retry_count = 0
             except asyncio.CancelledError:
                 bot.logger.info("Scheduler: Summary schedule cancelled - shutting down")
                 break
             except Exception as e:
-                bot.logger.error(f"Scheduler: Error generating summary: {e}")
-                bot.logger.debug(traceback.format_exc())
-                # Wait 1 hour before retrying on error
-                await asyncio.sleep(3600)
-                
+                retry_count += 1
+                if retry_count >= MAX_RETRIES:
+                    bot.logger.error(f"Scheduler: Failed after {MAX_RETRIES} attempts")
+                    bot._shutdown_flag = True
+                    raise
+                wait_time = min(INITIAL_RETRY_DELAY * (2 ** retry_count), MAX_RETRY_WAIT)
+                await asyncio.sleep(wait_time)
     except Exception as e:
         bot.logger.error(f"Scheduler: Fatal error in scheduler: {e}")
         bot.logger.debug(traceback.format_exc())
         bot._shutdown_flag = True
         raise
+
+async def cleanup_tasks(tasks):
+    """Properly cleanup any pending tasks"""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 def main():
     # Parse command line arguments
