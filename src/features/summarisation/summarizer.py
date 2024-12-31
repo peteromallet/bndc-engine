@@ -490,7 +490,7 @@ If there's nothing significant or noteworthy in the messages - if it's just casu
 Requirements:
 1. Make sure to ALWAYS include Discord links and external links 
 2. Use Discord's markdown format (not regular markdown)
-3. Use - for top-level points (no bullet for the header itself). Only use - for clear sub-points that directly relate to the point above. You should generally just create a new point for each new topic.
+3. Use - for top-level points. For sub-points that directly relate to the point above, use ⠀- (with an invisible space U+2800 before the dash)
 4. Make each main topic a ## header with an emoji
 5. Use ** for bold text (especially for usernames and main topics)
 6. Keep it simple - just bullet points and sub-points for each topic, no headers or complex formatting
@@ -501,14 +501,18 @@ Here's one example of what a good summary and topic should look like:
 
 ## 🤏 **H264/H265 Compression Techniques for Video Generation Improves Img2Vid**
 - **zeevfarbman** recommended h265 compression for frame degradation with less perceptual impact: https://discord.com/channels/1076117621407223829/1309520535012638740/1316462339318354011
+⠀- Compression reduces artifacts while maintaining quality
+⠀- Works especially well with motion interpolation
 - **johndopamine** suggested using h264 node in MTB node pack for better video generation: https://discord.com/channels/564534534/1316786801247260672
-- Codec compression can help "trick" current workflows/models: https://github.com/tdrussell/codex-pipe
-- melmass confirmed adding h265 support to their tools: https://discord.com/channels/1076117621407223829/1309520535012638740/1316786801247260672
+⠀- Codec compression can help "trick" current workflows/models: https://github.com/tdrussell/codex-pipe
+- **melmass** confirmed adding h265 support to their tools: https://discord.com/channels/1076117621407223829/1309520535012638740/1316786801247260672
 
 And here's another example of a good summary and topic:
 
 ## 🏋 **Person Training for Hunyuan Video is Now Possible**    
 - **Kytra** explained that training can be done on relatively modest hardware (24GB VRAM): https://discord.com/channels/1076117621407223829/1316079815446757396/1316418253102383135
+⠀- Training takes approximately 4 hours on 24GB
+⠀- Results are comparable to larger models
 - **TDRussell** provided the repository link: https://github.com/tdrussell/diffusion-pipe
 - Banodocians are generally experimenting with training LoRAs using images and videos
 
@@ -1290,8 +1294,7 @@ Full summary to work from:
             return
             
         async with self._summary_lock:
-            self.logger.info("generate_summary started")
-            self.logger.info("\nStarting summary generation")
+            self.logger.info("Starting summary generation")
             
             try:
                 self.current_summary_attachments = []  # Reset for new summary
@@ -1365,15 +1368,16 @@ Full summary to work from:
                             self.logger.error(f"Could not access channel {channel_id}")
                             continue
                         
-                        self.logger.info(f"Starting to process channel: {channel.name} ({channel_id})")  # Added
+                        self.logger.info(f"Starting to process channel: {channel.name} ({channel_id})")
                         messages = await self.get_channel_history(channel.id)
-                        self.logger.info(f"Retrieved {len(messages)} messages from {channel.name}")  # Added
+                        self.logger.info(f"Retrieved {len(messages)} messages from {channel.name}")
                         
                         # Store attachments from this channel
-                        attachment_count = 0  # Added
+                        attachment_count = 0
                         for message in messages:
                             if message.attachments:
-                                self.logger.debug(f"Processing {len(message.attachments)} attachments from message {message.id}")
+                                if self.dev_mode:
+                                    self.logger.debug(f"Processing {len(message.attachments)} attachments from message {message.id}")
                                 async with aiohttp.ClientSession() as session:
                                     for attachment in message.attachments:
                                         try:
@@ -1381,16 +1385,16 @@ Full summary to work from:
                                                 attachment, message, session
                                             )
                                             if processed:
-                                                attachment_count += 1  # Added
+                                                attachment_count += 1
                                         except Exception as e:
                                             self.logger.error(f"Error processing attachment in {channel.name}: {e}")
                                             continue
                         
-                        self.logger.info(f"Processed {attachment_count} attachments from {channel.name}")  # Added
+                        self.logger.info(f"Processed {attachment_count} attachments from {channel.name}")
                         
                         # Process messages for caching attachments regardless of channel type
                         if len(messages) >= 10:
-                            self.logger.info(f"Starting summary generation for {channel.name}")  # Added
+                            self.logger.info(f"Starting summary generation for {channel.name}")
                             # For gens channels, just process attachments without creating summary
                             if 'gens' in channel.name.lower():
                                 self.logger.info(f"Processing attachments for gens channel: {channel.name}")
@@ -1398,7 +1402,8 @@ Full summary to work from:
                             
                             # For non-gens channels, generate summary
                             summary = await self.get_claude_summary(messages)
-                            self.logger.info(f"Generated summary for {channel.name}: {summary[:100]}...")
+                            if self.dev_mode:
+                                self.logger.debug(f"Generated summary for {channel.name}: {summary[:100]}...")
                                     
                             if "[NOTHING OF NOTE]" not in summary:
                                 self.logger.info(f"Noteworthy activity found in {channel.name}")
@@ -1433,7 +1438,7 @@ Full summary to work from:
                             else:
                                 self.logger.info(f"No noteworthy activity in {channel.name}")
                         else:
-                            self.logger.warning(f"Skipping {channel.name} - only {len(messages)} messages")
+                            self.logger.info(f"Skipping {channel.name} - only {len(messages)} messages")
                         
                     except Exception as e:
                         self.logger.error(f"Error processing channel {channel.name} ({channel_id}): {e}")
@@ -1476,7 +1481,7 @@ Full summary to work from:
                 self.logger.error(f"Critical error in summary generation: {e}")
                 self.logger.debug(traceback.format_exc())
                 raise
-            self.logger.info("generate_summary completed")
+            self.logger.info("Summary generation completed")
 
     async def on_ready(self):
         self.logger.info(f"Logged in as {self.user}")
@@ -1970,7 +1975,7 @@ Full summary to work from:
 def main():
     # Parse command line arguments FIRST
     parser = argparse.ArgumentParser(description='Discord Channel Summarizer Bot')
-    parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately')
+    parser.add_argument('--summary-now', action='store_true', help='Run the summary process immediately')  # Changed from --run-now
     parser.add_argument('--dev', action='store_true', help='Run in development mode')
     args = parser.parse_args()
     
@@ -2000,7 +2005,7 @@ def main():
         bot.logger.info(f"Logged in as {bot.user.name} ({bot.user.id})")
         bot.logger.info("Connected to servers: %s", [guild.name for guild in bot.guilds])
         
-        if args.run_now:
+        if args.summary_now:  # Changed from args.run_now
             bot.logger.info("Running summary process immediately...")
             try:
                 await bot.generate_summary()

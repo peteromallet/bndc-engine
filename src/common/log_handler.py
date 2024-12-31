@@ -95,14 +95,14 @@ class LogHandler:
                 if dev_log_dir and not os.path.exists(dev_log_dir):
                     os.makedirs(dev_log_dir)
             
-            # Console handler - only show INFO and above in prod, DEBUG and above in dev
+            # Console handler - show INFO and above in prod for important operational logs
             console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.DEBUG if dev_mode else logging.WARNING)
+            console_handler.setLevel(logging.DEBUG if dev_mode else logging.INFO)
             console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
             
-            # Production file handler - only log WARNING and above
+            # Production file handler - log INFO and above for important operational logs
             try:
                 prod_handler = RotatingFileHandler(
                     self.prod_log_file,
@@ -110,7 +110,7 @@ class LogHandler:
                     backupCount=5,
                     encoding='utf-8'
                 )
-                prod_handler.setLevel(logging.WARNING)  # Only log warnings and above in prod
+                prod_handler.setLevel(logging.INFO)  # Changed to INFO to capture important operational logs
                 prod_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
                 prod_handler.setFormatter(prod_formatter)
                 logger.addHandler(prod_handler)
@@ -145,10 +145,10 @@ class LogHandler:
                 logger.addHandler(dev_handler)
             
             # Log startup info - critical setup logs always show
-            logger.warning(f"Logging configured in {'development' if dev_mode else 'production'} mode")
-            logger.warning(f"Production log file: {self.prod_log_file}")
+            logger.info(f"Logging configured in {'development' if dev_mode else 'production'} mode")
+            logger.info(f"Production log file: {self.prod_log_file}")
             if dev_mode and self.dev_log_file:
-                logger.warning(f"Development log file: {self.dev_log_file}")
+                logger.info(f"Development log file: {self.dev_log_file}")
             
             if not self._verify_file_writable(self.prod_log_file):
                 print("WARNING: Cannot write to production log file - logging to console only")

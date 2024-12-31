@@ -21,12 +21,16 @@ class ArtCurator(commands.Bot):
         # Setup logger
         self.logger = logger or logging.getLogger('ArtCurator')
         
-        # Dev mode flag (will be set from main.py)
+        # Initialize variables that will be set by dev_mode setter
+        self._dev_mode = None
+        self.art_channel_id = None
+        self.curator_ids = []
+        
+        # Set initial dev mode (this will trigger the setter to load correct IDs)
         self.dev_mode = False
         
-        # Load configuration
-        self.art_channel_id = None  # Will be set when dev_mode is set
-        self.curator_ids = [int(id) for id in os.getenv('CURATOR_IDS', '').split(',') if id]
+        # Add a set to track curators currently in rejection flow
+        self._active_rejections = set()
         
         # Register event handlers
         self.setup_events()
@@ -59,6 +63,8 @@ class ArtCurator(commands.Bot):
             self.logger.info(f'{self.user} has connected to Discord!')
             self.logger.info(f'Bot is in {len(self.guilds)} guilds')
             self.logger.info(f'Intents configured: {self.intents}')
+            self.logger.info(f'Art channel ID: {self.art_channel_id}')
+            self.logger.info(f'Curator IDs: {self.curator_ids}')
 
         @self.event
         async def on_message(message):
@@ -72,6 +78,7 @@ class ArtCurator(commands.Bot):
 
             # Check if message is in the art channel
             if message.channel.id == self.art_channel_id:
+                self.logger.info(f"Processing message in art channel from {message.author}")
                 allowed_domains = [
                     'youtube.com', 'youtu.be',    # YouTube
                     'vimeo.com',                  # Vimeo
@@ -121,7 +128,7 @@ class ArtCurator(commands.Bot):
                     
                     try:
                         await message.delete()
-                        self.logger.warning(f"Deleted message from {message.author} in channel {message.channel.id} due to invalid content.")
+                        self.logger.info(f"Deleted message from {message.author} in channel {message.channel.id} due to invalid content.")
                     except discord.Forbidden:
                         self.logger.error(f"Permission denied: Couldn't delete message from {message.author}.")
                     except Exception as e:
@@ -156,8 +163,7 @@ class ArtCurator(commands.Bot):
                 if has_valid_attachment and links:
                     try:
                         await message.edit(suppress=True)
-                        if self.dev_mode:
-                            self.logger.info(f"Suppressed embeds for message from {message.author}.")
+                        self.logger.info(f"Suppressed embeds for message from {message.author}.")
                     except discord.Forbidden:
                         self.logger.error("Bot doesn't have permission to edit messages.")
                     except Exception as e:
@@ -169,15 +175,16 @@ class ArtCurator(commands.Bot):
                         name=f"Discussion: {message.author.display_name}'s Art",
                         auto_archive_duration=10080  # Archives after 1 week of inactivity
                     )
-                    if self.dev_mode:
-                        self.logger.info(f"Created thread for message from {message.author}.")
+                    self.logger.info(f"Created thread for message from {message.author}.")
                     
                     # Add message about tagging the author
                     await thread.send(f"Make sure to tag <@{message.author.id}> in messages to make sure they see your comment!")
-                    if self.dev_mode:
-                        self.logger.info(f"Added tagging reminder message to thread.")
+                    self.logger.info(f"Added tagging reminder message to thread.")
                 except Exception as e:
                     self.logger.error(f"Error creating thread: {e}", exc_info=True)
+
+            # Process commands after handling the message
+            await self.process_commands(message)
 
         @self.event
         async def on_reaction_add(reaction, user):
@@ -192,6 +199,8 @@ class ArtCurator(commands.Bot):
             # Check if reaction is X and in art channel
             if (str(payload.emoji) in ['❌', '𝕏', 'X', '🇽'] and 
                 payload.channel_id == self.art_channel_id):
+                
+                self.logger.info(f"X reaction received in art channel from user {payload.user_id}")
                 
                 if self.dev_mode:
                     self.logger.debug(f"Reaction from user ID {payload.user_id}. Curators are: {self.curator_ids}")
@@ -210,7 +219,10 @@ class ArtCurator(commands.Bot):
                     
                     # Check if reactor is a curator
                     if payload.user_id in self.curator_ids:
+                        self.logger.info(f"Valid curator {user.name} ({payload.user_id}) reacted with X")
                         await self._handle_curator_rejection(message, user)
+                    else:
+                        self.logger.info(f"Non-curator {user.name} ({payload.user_id}) reacted with X - ignoring")
                         
                 except Exception as e:
                     self.logger.error(f"Error fetching message or user: {e}", exc_info=True)
@@ -223,7 +235,20 @@ class ArtCurator(commands.Bot):
 
     async def _handle_curator_rejection(self, message, user):
         """Handle the rejection process when a curator reacts with X"""
+        # Check if curator is already processing a rejection
+        if user.id in self._active_rejections:
+            try:
+                await user.send("Please complete your current rejection process before starting a new one. Reply to the above message with your reason for rejection or reply 'forget' to stop that rejection.")
+                await message.remove_reaction('❌', user)
+                self.logger.info(f"Curator {user.name} attempted multiple rejections - blocked.")
+                return
+            except discord.Forbidden:
+                self.logger.error(f"Couldn't DM curator {user.name} about multiple rejections.")
+                return
+
+        self._active_rejections.add(user.id)
         self.logger.warning(f"Curator {user.name} initiated a rejection.")
+        
         try:
             # Get the content URL or first attachment URL
             content_url = ""
@@ -329,14 +354,48 @@ class ArtCurator(commands.Bot):
                         if self.dev_mode:
                             self.logger.info(f"Sent removal reason DM to {author}.")
                         
-                        # Delete the thread if it exists
-                        if message.thread:
+                        # Get all threads in the channel
+                        threads = await message.guild.active_threads()
+                        if self.dev_mode:
+                            self.logger.debug(f"Found {len(threads)} active threads")
+                            for thread in threads:
+                                self.logger.debug(f"Thread {thread.id}: parent={thread.parent_id}, starter={thread.starter_message.id if thread.starter_message else 'None'}")
+                        
+                        # Find the thread that was started from this message and is in the correct channel
+                        message_thread = None
+                        for thread in threads:
                             try:
-                                await message.thread.delete()
+                                if (thread.parent_id == message.channel.id and 
+                                    thread.name.startswith(f"Discussion: {message.author.display_name}")):
+                                    message_thread = thread
+                                    break
+                            except Exception as e:
+                                if self.dev_mode:
+                                    self.logger.debug(f"Error checking thread {thread.id}: {e}")
+                                continue
+                        
+                        if message_thread:
+                            # Delete all messages in the thread first
+                            try:
+                                async for msg in message_thread.history(limit=None, oldest_first=False):
+                                    await msg.delete()
+                                    if self.dev_mode:
+                                        self.logger.info(f"Deleted message in thread for {author}'s post")
+                            except Exception as e:
+                                self.logger.error(f"Error deleting thread messages: {e}", exc_info=True)
+
+                            # Then delete the thread itself
+                            try:
+                                await message_thread.delete()
                                 if self.dev_mode:
                                     self.logger.info(f"Deleted thread for message from {author}.")
                             except Exception as e:
                                 self.logger.error(f"Error deleting thread: {e}", exc_info=True)
+                        else:
+                            if self.dev_mode:
+                                self.logger.debug(f"No thread found for message from {author}.")
+                    except Exception as e:
+                        self.logger.error(f"Error handling thread deletion: {e}", exc_info=True)
                                 
                     except discord.Forbidden:
                         self.logger.warning(f"Couldn't DM original poster {author}.")
@@ -352,3 +411,7 @@ class ArtCurator(commands.Bot):
                 
         except discord.Forbidden:
             self.logger.error(f"Couldn't DM curator {user.name}.")
+
+        finally:
+            # Make sure we remove the curator from active rejections even if there's an error
+            self._active_rejections.remove(user.id)

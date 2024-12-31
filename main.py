@@ -53,7 +53,7 @@ async def run_summarizer(bot, token, run_now):
         bot.logger.info("Summarizer bot is ready and fully connected")
             
         if run_now:
-            bot.logger.info("Running immediate summary...")
+            bot.logger.info("Running immediate summary generation...")
             await asyncio.sleep(2)  # Extra sleep
             await bot.generate_summary()
             bot._shutdown_flag = True  # Immediately shutdown after
@@ -119,28 +119,33 @@ async def schedule_daily_summary(bot):
             
             # Calculate how long to wait
             delay = (target - now).total_seconds()
-            bot.logger.info(f"Scheduler: Waiting {delay/3600:.2f} hours until next summary at {target} UTC")
+            hours_until_next = delay/3600
+            bot.logger.info(f"Next summary scheduled for {target} UTC ({hours_until_next:.1f} hours from now)")
             
             # Wait until the target time
             try:
                 await asyncio.sleep(delay)
                 if not bot._shutdown_flag:
+                    bot.logger.info("Starting scheduled summary generation")
                     await bot.generate_summary()
                     # Success - clear retry count
                     retry_count = 0
+                    bot.logger.info("Scheduled summary generation completed successfully")
             except asyncio.CancelledError:
-                bot.logger.info("Scheduler: Summary schedule cancelled - shutting down")
+                bot.logger.info("Summary schedule cancelled - shutting down")
                 break
             except Exception as e:
                 retry_count += 1
+                bot.logger.error(f"Summary generation attempt {retry_count}/{MAX_RETRIES} failed: {e}")
                 if retry_count >= MAX_RETRIES:
-                    bot.logger.error(f"Scheduler: Failed after {MAX_RETRIES} attempts")
+                    bot.logger.error(f"Failed after {MAX_RETRIES} attempts - shutting down scheduler")
                     bot._shutdown_flag = True
                     raise
                 wait_time = min(INITIAL_RETRY_DELAY * (2 ** retry_count), MAX_RETRY_WAIT)
+                bot.logger.info(f"Retrying in {wait_time/3600:.1f} hours")
                 await asyncio.sleep(wait_time)
     except Exception as e:
-        bot.logger.error(f"Scheduler: Fatal error in scheduler: {e}")
+        bot.logger.error(f"Fatal error in scheduler: {e}")
         bot.logger.debug(traceback.format_exc())
         bot._shutdown_flag = True
         raise
@@ -155,7 +160,7 @@ async def cleanup_tasks(tasks):
             except asyncio.CancelledError:
                 pass
 
-async def run_all_bots(curator_bot, summarizer_bot, token, run_now):
+async def run_all_bots(curator_bot, summarizer_bot, token, run_now, logger):
     """Run both bots concurrently"""
     try:
         # Create tasks for both bots
@@ -165,6 +170,9 @@ async def run_all_bots(curator_bot, summarizer_bot, token, run_now):
         summarizer_task = asyncio.create_task(
             run_summarizer(summarizer_bot, token, run_now)
         )
+        
+        curator_bot.logger.info("Starting curator bot")
+        summarizer_bot.logger.info("Starting summarizer bot")
         
         # Wait for either task to complete (or fail)
         done, pending = await asyncio.wait(
@@ -192,7 +200,7 @@ async def run_all_bots(curator_bot, summarizer_bot, token, run_now):
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Discord Bots')
-    parser.add_argument('--run-now', action='store_true', help='Run the summary process immediately')
+    parser.add_argument('--summary-now', action='store_true', help='Run the summary process immediately')
     parser.add_argument('--dev', action='store_true', help='Run in development mode')
     args = parser.parse_args()
     
@@ -201,6 +209,7 @@ def main():
     
     # Setup shared logging for both bots
     logger = setup_logging(args.dev)
+    logger.info("Starting bot initialization")
     
     # Create and configure both bots with shared logger
     curator_bot = ArtCurator(logger=logger)
@@ -223,12 +232,15 @@ def main():
         if not token:
             raise ValueError("Discord bot token not found in environment variables")
         
+        logger.info("Configuration loaded successfully, starting bots")
+        
         # Run both bots
         asyncio.run(run_all_bots(
             curator_bot,
             summarizer_bot,
             token,
-            args.run_now
+            args.summary_now,
+            logger
         ))
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
