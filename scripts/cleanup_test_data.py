@@ -6,6 +6,12 @@ from dotenv import load_dotenv, set_key
 import os
 import sys
 
+# Add parent directory to Python path BEFORE importing from src
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.common.constants import DATABASE_PATH
+from src.common.db_handler import DatabaseHandler
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -17,10 +23,7 @@ logger = logging.getLogger(__name__)
 discord_logger = logging.getLogger('discord')
 discord_logger.setLevel(logging.WARNING)
 
-# Add parent directory to Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.common.db_handler import DatabaseHandler
+logger.info(f"Using database at: {DATABASE_PATH}")
 
 class ChannelCleaner(commands.Bot):
     def __init__(self):
@@ -31,42 +34,77 @@ class ChannelCleaner(commands.Bot):
         
         super().__init__(command_prefix="!", intents=intents)
         self.db = DatabaseHandler()
+        logger.info(f"Connected to database at: {self.db.db_path}")
         self.target_user_id = 301463647895683072  # Add this line to store the target user ID
         
     async def delete_database_entries(self, channel_id: int):
         """Delete all database entries for a channel."""
         try:
-            # Get counts before deletion - handle case where query returns None
-            result = self.db.execute_query(
+            # Get counts before deletion
+            self.db.cursor.execute(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ?",
+                (channel_id,)
+            )
+            before_messages = self.db.cursor.fetchone()[0]
+            
+            self.db.cursor.execute(
                 "SELECT COUNT(*) FROM daily_summaries WHERE channel_id = ?",
                 (channel_id,)
             )
-            before_daily = result[0][0] if result else 0
+            before_daily = self.db.cursor.fetchone()[0]
             
-            result = self.db.execute_query(
+            self.db.cursor.execute(
                 "SELECT COUNT(*) FROM channel_summary WHERE channel_id = ?",
                 (channel_id,)
             )
-            before_summary = result[0][0] if result else 0
+            before_summary = self.db.cursor.fetchone()[0]
             
-            # Delete from daily_summaries
-            self.db.execute_query(
+            # Delete from all tables
+            self.db.cursor.execute(
+                "DELETE FROM messages WHERE channel_id = ?",
+                (channel_id,)
+            )
+            logger.info(f"Deleted {before_messages} entries from messages for channel {channel_id}")
+            
+            # Clean up FTS table
+            self.db.cursor.execute(
+                "DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE channel_id = ?)",
+                (channel_id,)
+            )
+            logger.info(f"Cleaned up FTS entries for channel {channel_id}")
+            
+            self.db.cursor.execute(
                 "DELETE FROM daily_summaries WHERE channel_id = ?",
                 (channel_id,)
             )
             logger.info(f"Deleted {before_daily} entries from daily_summaries for channel {channel_id}")
             
-            # Delete from channel_summary
-            self.db.execute_query(
+            self.db.cursor.execute(
                 "DELETE FROM channel_summary WHERE channel_id = ?",
                 (channel_id,)
             )
             logger.info(f"Deleted {before_summary} entries from channel_summary for channel {channel_id}")
             
+            # Commit all changes
+            self.db.conn.commit()
+            
+            # Verify deletions
+            self.db.cursor.execute(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ?",
+                (channel_id,)
+            )
+            after_messages = self.db.cursor.fetchone()[0]
+            
+            if after_messages > 0:
+                logger.warning(f"Still {after_messages} messages remaining for channel {channel_id}")
+            else:
+                logger.info(f"Successfully deleted all entries for channel {channel_id}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Error deleting database entries for channel {channel_id}: {e}")
+            self.db.conn.rollback()
             return False
 
     async def delete_messages(self, channel):

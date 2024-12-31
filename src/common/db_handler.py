@@ -377,3 +377,14 @@ class DatabaseHandler:
         except Exception as e:
             logger.error(f"Error getting message dates: {e}")
             return []
+
+    def execute_query(self, query: str, params: tuple = ()) -> List[tuple]:
+        """Execute a SQL query and return the results."""
+        try:
+            self.cursor.execute(query, params)
+            self.conn.commit()  # Commit after each query
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Database error executing query: {query}\nError: {e}")
+            self.conn.rollback()
+            raise

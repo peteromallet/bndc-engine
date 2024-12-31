@@ -1,33 +1,37 @@
-import discord
-import anthropic
-from datetime import datetime, timedelta, timezone
+# Standard library imports
 import asyncio
+import copy
+import io
+import json
+import logging
 import os
+import re
 import sys
+import traceback
+from datetime import datetime, timedelta
+from typing import List, Tuple, Set, Dict, Optional, Any, Union
+
+# Third-party imports
+import aiohttp
+import anthropic
+import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-import io
-import aiohttp
-import argparse
-import re
-import logging
-import traceback
-import random
-from typing import List, Tuple, Set, Dict, Optional, Any, Union
-from dataclasses import dataclass
 
-# Add src directory to Python path
-src_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, src_path)
+# Local imports
+from src.common.db_handler import DatabaseHandler
+from src.common.errors import *
+from src.common.error_handler import ErrorHandler, handle_errors
+from src.common.rate_limiter import RateLimiter
+from src.common.log_handler import LogHandler
 
-from common.db_handler import DatabaseHandler
-from common.errors import *
-from common.error_handler import ErrorHandler, handle_errors
-from common.rate_limiter import RateLimiter
-from common.log_handler import LogHandler
-import json
-from logging.handlers import RotatingFileHandler
-import copy
+# Optional imports for media processing
+try:
+    from PIL import Image
+    import moviepy.editor as mp
+    MEDIA_PROCESSING_AVAILABLE = True
+except ImportError:
+    MEDIA_PROCESSING_AVAILABLE = False
 
 class ChannelSummarizerError(Exception):
     """Base exception class for ChannelSummarizer"""
@@ -1500,9 +1504,9 @@ Full summary to work from:
     async def create_media_content(self, files: List[Tuple[discord.File, int, str, str]], max_media: int = 4) -> Optional[discord.File]:
         """Create either a collage of images or a combined video based on media type."""
         try:
-            from PIL import Image
-            import moviepy.editor as mp
-            import io
+            if not MEDIA_PROCESSING_AVAILABLE:
+                self.logger.error("Media processing libraries are not available")
+                return None
             
             self.logger.info(f"Starting media content creation with {len(files)} files")
             
@@ -1625,102 +1629,134 @@ Full summary to work from:
         try:
             self.logger.info("Starting create_top_generations_thread")
             
-            # Get the correct channel to monitor in dev mode
+            # Get channels to monitor based on mode
+            channels_to_check = []
             if self.dev_mode:
-                # CHANGE: Fix the channel ID extraction from cache keys
-                monitored_channels = list(set(
-                    int(cache_key.split(':')[0])  # Only take the channel ID part before the colon
-                    for cache_key in self.attachment_handler.attachment_cache.keys()
-                ))
-                
-                self.logger.info(f"Using cached channels in dev mode: {monitored_channels}")
-                
-                # Don't update channels_to_monitor in dev mode
-                self.approved_channels = monitored_channels  # Allow all channels with cached attachments
-                
+                channels_str = os.getenv('DEV_CHANNELS_TO_MONITOR')
+                if channels_str:
+                    category_ids = [int(id.strip()) for id in channels_str.split(',')]
+                    # Get all text channels within these categories
+                    for category_id in category_ids:
+                        category = self.get_channel(category_id)
+                        if isinstance(category, discord.CategoryChannel):
+                            # Only add text channels, not the categories themselves
+                            text_channels = [
+                                channel for channel in category.channels 
+                                if isinstance(channel, discord.TextChannel)
+                            ]
+                            channels_to_check.extend(text_channels)
+                        elif isinstance(category, discord.TextChannel):
+                            # If it's already a text channel, add it directly
+                            channels_to_check.append(category)
             else:
-                monitored_channels = [int(chan) for chan in self.channels_to_monitor]
-                self.logger.info(f"Monitoring channels: {monitored_channels}")
-                
-                # Add generations channels to approved_channels
-                guild = self.get_guild(self.guild_id)
-                if guild:
-                    for channel in guild.text_channels:
-                        if 'gen' in channel.name.lower() and channel.id not in self.approved_channels:
-                            self.approved_channels.append(channel.id)
-                            self.logger.info(f"Including generations channel: {channel.name} (ID: {channel.id})")
+                # In production, use CHANNELS_TO_MONITOR
+                channels_str = os.getenv('CHANNELS_TO_MONITOR')
+                if channels_str:
+                    channel_ids = [int(id.strip()) for id in channels_str.split(',')]
+                    for channel_id in channel_ids:
+                        channel = self.get_channel(channel_id)
+                        if isinstance(channel, discord.CategoryChannel):
+                            # Add all text channels from category
+                            text_channels = [
+                                c for c in channel.channels 
+                                if isinstance(c, discord.TextChannel)
+                            ]
+                            channels_to_check.extend(text_channels)
+                        elif isinstance(channel, discord.TextChannel):
+                            # Add individual text channel
+                            channels_to_check.append(channel)
+
+            # Remove duplicates and None channels
+            channels_to_check = list(dict.fromkeys([c for c in channels_to_check if c is not None]))
+            self.logger.info(f"Found {len(channels_to_check)} text channels to check")
             
-            self.logger.debug(f"Approved channels: {self.approved_channels}")
-            
-            # Get all video attachments from stored attachments
+            # Collect videos from the last 24 hours
             video_attachments = []
-            seen_videos = set()  # Track unique videos by filename + username
+            yesterday = datetime.utcnow() - timedelta(days=1)
             
-            # Track all videos from the attachment cache
-            for cache_key, cache_data in self.attachment_handler.attachment_cache.items():
+            for channel in channels_to_check:
                 try:
-                    channel_id = int(cache_key.split(':')[0])
-                    
-                    # CHANGE: In dev mode, accept all channels that have cached attachments
-                    if self.dev_mode:
-                        channel = self.get_channel(channel_id)
-                        if not channel:
-                            continue
-                        
-                        # Skip if channel name contains 'support' or 'art'
-                        if any(term in channel.name.lower() for term in ['support', 'art']):
-                            continue
-                    else:
-                        # Production mode checks
-                        if channel_id not in monitored_channels:
-                            self.logger.debug(f"Skipping channel {channel_id} - not in monitored list")
-                            continue
-                        
-                        if channel_id not in self.approved_channels:
-                            self.logger.debug(f"Skipping channel {channel_id} - not in approved list")
-                            continue
-                        
-                        channel = self.get_channel(channel_id)
-                        if not channel:
-                            continue
-                        
-                        if 'support' in channel.name.lower() and 'gen' not in channel.name.lower():
-                            self.logger.debug(f"Skipping support channel: {channel.name}")
-                            continue
-
-                    for attachment in cache_data['attachments']:
-                        # Create a unique identifier for this video
-                        video_id = f"{attachment.filename}:{cache_data['username']}"
-                        
-                        # More lenient video check
-                        is_video = any(attachment.filename.lower().endswith(ext) 
-                                      for ext in ('.mp4', '.mov', '.webm', '.avi'))
-                        
-                        if is_video and cache_data['reaction_count'] >= 3:
-                            self.logger.info(f"Found video in {channel.name} with {cache_data['reaction_count']} reactions")
+                    self.logger.info(f"Processing channel: {channel.name}")
+                    async for message in channel.history(after=yesterday, limit=100):
+                        if message.attachments:
+                            self.logger.debug(f"Found message with {len(message.attachments)} attachments")
                             
-                            video_attachments.append({
-                                'attachment': attachment,
-                                'channel_name': channel.name,
-                                'reaction_count': cache_data['reaction_count'],
-                                'username': cache_data['username']
-                            })
-                            self.logger.info(f"Added video to top generations list")
-
+                            # Count unique reactors
+                            unique_reactors = set()
+                            for reaction in message.reactions:
+                                async for user in reaction.users():
+                                    unique_reactors.add(user.id)
+                                    
+                            reaction_count = len(unique_reactors)
+                            
+                            # Log reaction count
+                            if reaction_count > 0:
+                                self.logger.debug(f"Message has {reaction_count} unique reactions")
+                            
+                            for attachment in message.attachments:
+                                is_video = any(attachment.filename.lower().endswith(ext) 
+                                             for ext in ('.mp4', '.mov', '.webm', '.avi'))
+                                
+                                if is_video:
+                                    self.logger.debug(f"Found video: {attachment.filename}")
+                                    if reaction_count >= 3:
+                                        self.logger.info(f"Qualifying video found in {channel.name}: {attachment.filename} with {reaction_count} reactions")
+                                        
+                                        # Download the attachment only for qualifying videos
+                                        file_data = await attachment.read()
+                                        
+                                        video_attachments.append({
+                                            'attachment': Attachment(
+                                                filename=attachment.filename,
+                                                data=file_data,
+                                                content_type=attachment.content_type,
+                                                reaction_count=reaction_count,
+                                                username=message.author.name,
+                                                content=message.content,
+                                                jump_url=message.jump_url
+                                            ),
+                                            'channel_name': channel.name,
+                                            'reaction_count': reaction_count,
+                                            'username': message.author.name
+                                        })
+                                        
+                                        self.logger.info(f"Found qualifying video in {channel.name} with {reaction_count} reactions")
+                                    else:
+                                        self.logger.debug(f"Video {attachment.filename} skipped - only {reaction_count} reactions")
+                                        
+                                        # Download the attachment
+                                        file_data = await attachment.read()
+                                        
+                                        video_attachments.append({
+                                            'attachment': Attachment(
+                                                filename=attachment.filename,
+                                                data=file_data,
+                                                content_type=attachment.content_type,
+                                                reaction_count=reaction_count,
+                                                username=message.author.name,
+                                                content=message.content,
+                                                jump_url=message.jump_url
+                                            ),
+                                            'channel_name': channel.name,
+                                            'reaction_count': reaction_count,
+                                            'username': message.author.name
+                                        })
+                                        
+                                        self.logger.info(f"Found video in {channel.name} with {reaction_count} reactions")
+                                        
                 except Exception as e:
-                    self.logger.error(f"Error processing cache key {cache_key}: {e}")
+                    self.logger.error(f"Error processing channel {channel.name}: {e}")
                     continue
-
 
             # Check if we have any videos before proceeding
             if not video_attachments:
                 self.logger.info("No qualifying videos found - skipping top generations thread")
                 return
-            
-            # Sort by unique reactor count
+                
+            # Sort by reaction count
             video_attachments.sort(key=lambda x: x['reaction_count'], reverse=True)
             
-            # Take top 10 but include ALL videos that meet criteria
+            # Take top 10
             top_generations = video_attachments[:10]
 
             # Get the top generation for the header message
