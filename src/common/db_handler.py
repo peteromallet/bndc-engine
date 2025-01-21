@@ -65,7 +65,6 @@ class DatabaseHandler:
                     date TEXT NOT NULL,
                     channel_id BIGINT NOT NULL,
                     message_count INTEGER NOT NULL,
-                    raw_messages TEXT NOT NULL,
                     full_summary TEXT,
                     short_summary TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -220,9 +219,9 @@ class DatabaseHandler:
                         )
                     
                     # Ensure all fields are properly serialized
-                    attachments_json = json.dumps(message.get('attachments', []))
-                    embeds_json = json.dumps(message.get('embeds', []))
-                    reactors_json = json.dumps(message.get('reactors', []))
+                    attachments_json = json.dumps(message.get('attachments', []) if isinstance(message.get('attachments'), (list, dict)) else json.loads(message.get('attachments', '[]')))
+                    embeds_json = json.dumps(message.get('embeds', []) if isinstance(message.get('embeds'), (list, dict)) else json.loads(message.get('embeds', '[]')))
+                    reactors_json = json.dumps(message.get('reactors', []) if isinstance(message.get('reactors'), (list, dict)) else json.loads(message.get('reactors', '[]')))
                     created_at = message.get('created_at')
                     if created_at:
                         created_at = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
@@ -333,32 +332,15 @@ class DatabaseHandler:
             # First create or update the channel record
             self.create_or_update_channel(channel_id, channel_name)
             
-            # Convert messages to serializable format
-            messages_data = []
-            for msg in messages:
-                message_dict = {
-                    'content': msg['content'],
-                    'author': msg['author'],
-                    'timestamp': msg['timestamp'],  # Already ISO format
-                    'jump_url': msg['jump_url'],
-                    'reactions': msg['reactions'],
-                    'id': msg['id'],
-                    'attachments': msg['attachments']
-                }
-                messages_data.append(message_dict)
-            
-            messages_json = json.dumps(messages_data)
-            
             self.cursor.execute("""
                 INSERT OR REPLACE INTO daily_summaries 
-                (date, channel_id, message_count, raw_messages, 
+                (date, channel_id, message_count, 
                  full_summary, short_summary)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 date.isoformat() if isinstance(date, datetime) else date,  # Ensure date is ISO format
                 channel_id,
                 len(messages),
-                messages_json,
                 full_summary,
                 short_summary
             ))

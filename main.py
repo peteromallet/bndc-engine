@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import traceback
 import time
+import discord
 
 from src.features.curation.curator import ArtCurator
 from src.features.summarisation.summarizer import ChannelSummarizer
@@ -40,68 +41,90 @@ MAX_RETRY_WAIT = 24 * 3600  # 24 hours in seconds
 
 async def run_summarizer(bot, token, run_now):
     """Run the summarizer bot with optional immediate summary generation"""
-    try:
-        # Create task for bot connection
-        bot_task = asyncio.create_task(bot.start(token))
-        
-        # Wait for bot to be ready
-        start_time = time.time()
-        while not bot.is_ready():
-            if time.time() - start_time > READY_TIMEOUT:
-                raise TimeoutError("Summarizer bot failed to become ready within timeout period")
-            await asyncio.sleep(1)
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            # Create task for bot connection
+            bot_task = asyncio.create_task(bot.start(token))
             
-        bot.logger.info("Summarizer bot is ready and fully connected")
-            
-        if run_now:
-            bot.logger.info("Running immediate summary generation...")
-            await asyncio.sleep(2)  # Extra sleep
-            await bot.generate_summary()
-            bot._shutdown_flag = True  # Immediately shutdown after
-            await bot.close()
-            bot_task.cancel()
-            await cleanup_tasks([bot_task])
-        else:
-            bot.logger.info("Starting scheduled mode...")
-            # Create and start the scheduler task
-            scheduler_task = asyncio.create_task(schedule_daily_summary(bot))
-            
-            # Wait for either the bot task or scheduler task to complete
-            done, pending = await asyncio.wait(
-                [bot_task, scheduler_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            # Cancel any pending tasks
-            await cleanup_tasks(pending)
-            
-    except Exception as e:
-        bot.logger.error(f"Error running summarizer bot: {e}")
-        traceback.print_exc()
-        raise
+            # Wait for bot to be ready
+            start_time = time.time()
+            while not bot.is_ready():
+                if time.time() - start_time > READY_TIMEOUT:
+                    raise TimeoutError("Summarizer bot failed to become ready within timeout period")
+                await asyncio.sleep(1)
+                
+            bot.logger.info("Summarizer bot is ready and fully connected")
+                
+            if run_now:
+                bot.logger.info("Running immediate summary generation...")
+                await asyncio.sleep(2)  # Extra sleep
+                await bot.generate_summary()
+                bot._shutdown_flag = True  # Immediately shutdown after
+                await bot.close()
+                bot_task.cancel()
+                await cleanup_tasks([bot_task])
+            else:
+                bot.logger.info("Starting scheduled mode...")
+                # Create and start the scheduler task
+                scheduler_task = asyncio.create_task(schedule_daily_summary(bot))
+                
+                # Wait for either the bot task or scheduler task to complete
+                done, pending = await asyncio.wait(
+                    [bot_task, scheduler_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel any pending tasks
+                await cleanup_tasks(pending)
+            return  # Success - exit the retry loop
+                
+        except (TimeoutError, discord.errors.DiscordServerError) as e:
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                bot.logger.error(f"Failed to connect after {MAX_RETRIES} attempts")
+                raise
+            wait_time = min(INITIAL_RETRY_DELAY * (2 ** retry_count), MAX_RETRY_WAIT)
+            bot.logger.warning(f"Connection attempt {retry_count} failed: {e}. Retrying in {wait_time/3600:.1f} hours")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            bot.logger.error(f"Error running summarizer bot: {e}")
+            traceback.print_exc()
+            raise
 
 async def run_curator(bot, token):
     """Run the curator bot"""
-    try:
-        # Create task for bot connection
-        bot_task = asyncio.create_task(bot.start(token))
-        
-        # Wait for bot to be ready
-        start_time = time.time()
-        while not bot.is_ready():
-            if time.time() - start_time > READY_TIMEOUT:
-                raise TimeoutError("Curator bot failed to become ready within timeout period")
-            await asyncio.sleep(1)
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            # Create task for bot connection
+            bot_task = asyncio.create_task(bot.start(token))
             
-        bot.logger.info("Curator bot is ready and fully connected")
-            
-        # Wait for the bot task to complete or be cancelled
-        await bot_task
-            
-    except Exception as e:
-        bot.logger.error(f"Error running curator bot: {e}")
-        traceback.print_exc()
-        raise
+            # Wait for bot to be ready
+            start_time = time.time()
+            while not bot.is_ready():
+                if time.time() - start_time > READY_TIMEOUT:
+                    raise TimeoutError("Curator bot failed to become ready within timeout period")
+                await asyncio.sleep(1)
+                
+            bot.logger.info("Curator bot is ready and fully connected")
+                
+            # Wait for the bot task to complete or be cancelled
+            await bot_task
+            return  # Success - exit the retry loop
+                
+        except (TimeoutError, discord.errors.DiscordServerError) as e:
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                bot.logger.error(f"Failed to connect after {MAX_RETRIES} attempts")
+                raise
+            wait_time = min(INITIAL_RETRY_DELAY * (2 ** retry_count), MAX_RETRY_WAIT)
+            bot.logger.warning(f"Connection attempt {retry_count} failed: {e}. Retrying in {wait_time/3600:.1f} hours")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            bot.logger.error(f"Error running curator bot: {e}")
+            traceback.print_exc()
+            raise
 
 async def schedule_daily_summary(bot):
     """Run daily summaries on schedule. Only exits if there's an error or explicit shutdown."""
@@ -163,26 +186,37 @@ async def cleanup_tasks(tasks):
 
 async def run_logger(bot, token):
     """Run the message logger bot"""
-    try:
-        # Create task for bot connection
-        bot_task = asyncio.create_task(bot.start(token))
-        
-        # Wait for bot to be ready
-        start_time = time.time()
-        while not bot.is_ready():
-            if time.time() - start_time > READY_TIMEOUT:
-                raise TimeoutError("Logger bot failed to become ready within timeout period")
-            await asyncio.sleep(1)
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            # Create task for bot connection
+            bot_task = asyncio.create_task(bot.start(token))
             
-        bot.logger.info("Logger bot is ready and fully connected")
-            
-        # Wait for the bot task to complete or be cancelled
-        await bot_task
-            
-    except Exception as e:
-        bot.logger.error(f"Error running logger bot: {e}")
-        traceback.print_exc()
-        raise
+            # Wait for bot to be ready
+            start_time = time.time()
+            while not bot.is_ready():
+                if time.time() - start_time > READY_TIMEOUT:
+                    raise TimeoutError("Logger bot failed to become ready within timeout period")
+                await asyncio.sleep(1)
+                
+            bot.logger.info("Logger bot is ready and fully connected")
+                
+            # Wait for the bot task to complete or be cancelled
+            await bot_task
+            return  # Success - exit the retry loop
+                
+        except (TimeoutError, discord.errors.DiscordServerError) as e:
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                bot.logger.error(f"Failed to connect after {MAX_RETRIES} attempts")
+                raise
+            wait_time = min(INITIAL_RETRY_DELAY * (2 ** retry_count), MAX_RETRY_WAIT)
+            bot.logger.warning(f"Connection attempt {retry_count} failed: {e}. Retrying in {wait_time/3600:.1f} hours")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            bot.logger.error(f"Error running logger bot: {e}")
+            traceback.print_exc()
+            raise
 
 async def run_all_bots(curator_bot, summarizer_bot, logger_bot, token, run_now, logger):
     """Run all bots concurrently"""

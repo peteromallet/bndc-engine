@@ -85,6 +85,9 @@ class LogHandler:
             # Clear any existing handlers
             logger.handlers.clear()
             
+            # Prevent propagation to avoid duplicate logs
+            logger.propagate = False
+            
             # Ensure log directory exists for production log
             log_dir = os.path.dirname(self.prod_log_file)
             if log_dir and not os.path.exists(log_dir):

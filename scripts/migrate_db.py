@@ -267,32 +267,147 @@ def migrate_daily_summaries(cursor):
         logger.error(f"Error during daily_summaries migration: {e}")
         raise
 
+def migrate_remove_raw_messages(cursor):
+    """Remove raw_messages column from daily_summaries table."""
+    logger.info("Starting raw_messages removal migration")
+    
+    try:
+        # First check if raw_messages column exists
+        cursor.execute("PRAGMA table_info(daily_summaries)")
+        columns = {col[1]: col for col in cursor.fetchall()}
+        
+        if 'raw_messages' not in columns:
+            logger.info("raw_messages column already removed")
+            return
+            
+        # Get original row count
+        cursor.execute("SELECT COUNT(*) FROM daily_summaries")
+        original_count = cursor.fetchone()[0]
+        
+        # Create backup
+        backup_name = backup_table(cursor, "daily_summaries")
+        logger.info(f"Created backup table: {backup_name}")
+        
+        try:
+            # Create new table without raw_messages
+            cursor.execute("""
+                CREATE TABLE daily_summaries_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    full_summary TEXT,
+                    short_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, channel_id) ON CONFLICT REPLACE,
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+                )
+            """)
+            
+            # Copy data to new table
+            cursor.execute("""
+                INSERT INTO daily_summaries_new 
+                (id, date, channel_id, message_count, 
+                 full_summary, short_summary, created_at)
+                SELECT 
+                    id, date, channel_id, message_count,
+                    full_summary, short_summary, created_at
+                FROM daily_summaries
+            """)
+            
+            # Validate before dropping old table
+            cursor.execute("SELECT COUNT(*) FROM daily_summaries_new")
+            if cursor.fetchone()[0] != original_count:
+                raise ValueError("Row count mismatch before table swap")
+            
+            # Drop old table and rename new one
+            cursor.execute("DROP TABLE daily_summaries")
+            cursor.execute("ALTER TABLE daily_summaries_new RENAME TO daily_summaries")
+            
+            logger.info("Successfully removed raw_messages column")
+            
+        except Exception as e:
+            # If anything goes wrong, we can restore from backup
+            logger.error(f"Migration failed: {e}")
+            cursor.execute("DROP TABLE IF EXISTS daily_summaries")
+            cursor.execute(f"ALTER TABLE {backup_name} RENAME TO daily_summaries")
+            raise
+            
+    except Exception as e:
+        logger.error(f"Error during raw_messages removal migration: {e}")
+        raise
+
+def cleanup_backup_tables(cursor):
+    """Clean up any backup tables from previous migrations."""
+    try:
+        # Get list of all tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_backup_%'")
+        backup_tables = cursor.fetchall()
+        
+        for (table_name,) in backup_tables:
+            logger.info(f"Dropping backup table: {table_name}")
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            
+    except Exception as e:
+        logger.error(f"Error cleaning up backup tables: {e}")
+        raise
+
 def main():
     """Main migration function."""
+    # Add argument parsing
+    parser = argparse.ArgumentParser(description='Migrate database schema')
+    parser.add_argument('--dev', action='store_true', help='Only migrate development database')
+    parser.add_argument('--prod', action='store_true', help='Only migrate production database')
+    args = parser.parse_args()
+    
     try:
         logger.info("Starting database migration")
         
-        # Connect to database
-        db_path = get_database_path()
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Run migrations
-        migrate_daily_summaries(cursor)
-        
-        # Commit changes
-        conn.commit()
-        logger.info("Migration completed successfully")
+        # Determine which databases to process
+        if args.dev:
+            databases = [True]  # Only dev
+        elif args.prod:
+            databases = [False]  # Only prod
+        else:
+            databases = [True, False]  # Both
+            
+        # Run migrations for selected databases
+        for dev_mode in databases:
+            db_path = get_database_path(dev_mode)
+            logger.info(f"Processing {'development' if dev_mode else 'production'} database at: {db_path}")
+            
+            # Skip if database doesn't exist
+            if not os.path.exists(db_path):
+                logger.info(f"Database does not exist at {db_path}, skipping...")
+                continue
+            
+            # Connect to database
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            try:
+                # Run migrations
+                migrate_daily_summaries(cursor)
+                migrate_remove_raw_messages(cursor)
+                
+                # Clean up backup tables after successful migration
+                cleanup_backup_tables(cursor)
+                
+                # Commit changes
+                conn.commit()
+                logger.info(f"Migration completed successfully for {'development' if dev_mode else 'production'} database")
+                
+            except Exception as e:
+                logger.error(f"Migration failed for {'development' if dev_mode else 'production'} database: {e}")
+                conn.rollback()
+                raise
+                
+            finally:
+                conn.close()
         
     except Exception as e:
         logger.error(f"Migration failed: {e}")
-        if 'conn' in locals():
-            conn.rollback()
         raise
-        
-    finally:
-        if 'conn' in locals():
-            conn.close()
 
 if __name__ == "__main__":
     main() 

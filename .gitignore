@@ -60,5 +60,5 @@ local_settings.py
 *.bak
 *.swp
 
-# mp4 files
-*.mp4
+# New file
+channel_descriptions.json
