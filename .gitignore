@@ -59,3 +59,6 @@ local_settings.py
 *.tmp
 *.bak
 *.swp
+
+# mp4 files
+*.mp4
