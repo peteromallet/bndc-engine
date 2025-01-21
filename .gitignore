@@ -34,6 +34,7 @@ env/
 *.log
 logs/
 archive_discord.log
+files/
 
 # db
 *.db

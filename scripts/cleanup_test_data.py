@@ -5,11 +5,12 @@ import logging
 from dotenv import load_dotenv, set_key
 import os
 import sys
+import argparse
 
 # Add parent directory to Python path BEFORE importing from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.common.constants import DATABASE_PATH
+from src.common.constants import get_database_path
 from src.common.db_handler import DatabaseHandler
 
 # Configure logging
@@ -23,7 +24,13 @@ logger = logging.getLogger(__name__)
 discord_logger = logging.getLogger('discord')
 discord_logger.setLevel(logging.WARNING)
 
-logger.info(f"Using database at: {DATABASE_PATH}")
+def main():
+    parser = argparse.ArgumentParser(description='Cleanup Test Data')
+    parser.add_argument('--dev', action='store_true', help='Run cleanup on development database')
+    args = parser.parse_args()
+    
+    db_path = get_database_path(args.dev)
+    logger.info(f"Using database at: {db_path}")
 
 class ChannelCleaner(commands.Bot):
     def __init__(self):
@@ -231,70 +238,5 @@ class ChannelCleaner(commands.Bot):
         self.db.conn.close()  # Remove await - sqlite connection doesn't use async
         await super().close()
 
-async def main():
-    # Load environment variables
-    load_dotenv()
-    
-    # Hardcode category ID for testing
-    dev_category_id = '1320120516954034186'
-    logger.info(f"Using hardcoded category ID: {dev_category_id}")
-    
-    bot_token = os.getenv('DISCORD_BOT_TOKEN')
-    summary_channel_id = int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))
-    
-    @bot.event
-    async def on_ready():
-        logger.info(f"Logged in as {bot.user}")
-        total_deleted = 0
-        
-        # First clean the summary channel
-        try:
-            summary_channel = bot.get_channel(summary_channel_id)
-            if summary_channel:
-                logger.info(f"Processing summary channel: #{summary_channel.name}")
-                deleted = await bot.clean_channel_and_threads(summary_channel)
-                total_deleted += deleted
-                logger.info(f"Finished cleaning summary channel #{summary_channel.name}: {deleted} messages deleted")
-            else:
-                logger.error(f"Could not find summary channel with ID: {summary_channel_id}")
-        except Exception as e:
-            logger.error(f"Error processing summary channel: {e}")
-        
-        # Process the category
-        try:
-            category_id_int = int(dev_category_id)
-            category = bot.get_channel(category_id_int)
-            
-            if not category:
-                logger.error(f"Could not find category with ID: {category_id_int}")
-            else:
-                logger.info(f"Processing category: {category.name}")
-                deleted = await bot.clean_channel_and_threads(category)
-                total_deleted += deleted
-                logger.info(f"Finished processing category: {category.name}")
-                
-        except ValueError as e:
-            logger.error(f"Invalid category ID format: '{dev_category_id}'")
-        except Exception as e:
-            logger.error(f"Error processing category: {e}")
-        
-        logger.info(f"Category processing complete. Total messages deleted: {total_deleted}")
-        
-        # Properly close the session before shutting down
-        await bot.http.close()
-        await bot.close()
-    
-    await bot.start(bot_token)
-
 if __name__ == "__main__":
-    # Create bot instance outside of main
-    bot = ChannelCleaner()
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, shutting down...")
-    finally:
-        # Ensure everything is cleaned up
-        if not bot.is_closed():
-            asyncio.run(bot.close())
+    main()

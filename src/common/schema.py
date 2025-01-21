@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 @dataclass
 class Column:
@@ -23,7 +23,8 @@ def get_messages_schema() -> List[Column]:
         Column("created_at", "TEXT", "Timestamp when message was created"),
         Column("attachments", "TEXT", "JSON string of message attachments"),
         Column("embeds", "TEXT", "JSON string of message embeds"),
-        Column("reactions", "TEXT", "JSON string of message reactions"),
+        Column("reaction_count", "INTEGER", "Total number of reactions on the message", default="0"),
+        Column("reactors", "TEXT", "JSON string of user IDs who reacted", nullable=True),
         Column("reference_id", "BIGINT", "ID of message being replied to"),
         Column("edited_at", "TEXT", "Timestamp of last edit", nullable=True),
         Column("is_pinned", "BOOLEAN", "Whether message is pinned"),
@@ -35,14 +36,20 @@ def get_messages_schema() -> List[Column]:
                default="CURRENT_TIMESTAMP")
     ]
 
-def get_schema_tuples() -> List[tuple]:
-    """Convert schema to simple (name, type) tuples for migration."""
-    def build_type(col: Column) -> str:
-        type_def = col.type
-        if not col.nullable:
-            type_def += " NOT NULL"
-        if col.default is not None:
-            type_def += f" DEFAULT {col.default}"
-        return type_def
+def get_members_schema() -> List[Column]:
+    """Define the schema structure for the members table."""
+    return [
+        Column("id", "BIGINT PRIMARY KEY", "Discord user ID"),
+        Column("username", "TEXT NOT NULL", "Discord username"),
+        Column("display_name", "TEXT", "Display name in the server", nullable=True),
+        Column("created_at", "TIMESTAMP", "When member was first added to database", 
+               default="CURRENT_TIMESTAMP"),
+        Column("updated_at", "TIMESTAMP", "When member was last updated", 
+               default="CURRENT_TIMESTAMP")
+    ]
 
-    return [(col.name, build_type(col)) for col in get_messages_schema()] 
+def get_schema_tuples() -> List[Tuple[str, str]]:
+    """Get all schema definitions as tuples of (name, type)."""
+    messages_schema = [(col.name, col.type) for col in get_messages_schema()]
+    members_schema = [(col.name, col.type) for col in get_members_schema()]
+    return messages_schema + members_schema 

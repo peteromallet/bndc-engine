@@ -4,20 +4,22 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
-from .constants import DATABASE_PATH
+from .constants import get_database_path
 
 logger = logging.getLogger('DiscordBot')
 
 class DatabaseHandler:
-    def __init__(self, db_path: str = DATABASE_PATH):
+    def __init__(self, db_path: Optional[str] = None, dev_mode: bool = False):
         """Initialize database connection and ensure directory exists."""
         try:
+            # Use provided path or get appropriate path based on mode
+            self.db_path = db_path if db_path else get_database_path(dev_mode)
+            
             # Ensure the directory exists
-            db_dir = Path(db_path).parent
+            db_dir = Path(self.db_path).parent
             db_dir.mkdir(parents=True, exist_ok=True)
             
-            self.db_path = db_path
-            self.conn = sqlite3.connect(db_path)
+            self.conn = sqlite3.connect(self.db_path)
             self.cursor = self.conn.cursor()
             
             # Initialize all tables
@@ -30,22 +32,82 @@ class DatabaseHandler:
     def init_db(self):
         """Initialize all database tables."""
         try:
+            # Channels table with new fields - define this FIRST since other tables reference it
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channels (
+                    channel_id BIGINT PRIMARY KEY,
+                    channel_name TEXT NOT NULL,
+                    description TEXT,
+                    suitable_posts TEXT,
+                    unsuitable_posts TEXT,
+                    rules TEXT,
+                    setup_complete BOOLEAN DEFAULT FALSE,
+                    nsfw BOOLEAN DEFAULT FALSE,
+                    enriched BOOLEAN DEFAULT FALSE
+                )
+            """)
+
+            # Channel summary threads table with foreign key
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channel_summary (
+                    channel_id BIGINT PRIMARY KEY,
+                    summary_thread_id BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+                )
+            """)
+            
+            # Daily summaries table with foreign key
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    raw_messages TEXT NOT NULL,
+                    full_summary TEXT,
+                    short_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, channel_id) ON CONFLICT REPLACE,
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+                )
+            """)
+            
+            # Members table
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS members (
+                    id BIGINT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    global_name TEXT,
+                    server_nick TEXT,
+                    avatar_url TEXT,
+                    discriminator TEXT,
+                    bot BOOLEAN DEFAULT FALSE,
+                    system BOOLEAN DEFAULT FALSE,
+                    accent_color INTEGER,
+                    banner_url TEXT,
+                    discord_created_at TEXT,
+                    guild_join_date TEXT,
+                    role_ids TEXT,  /* JSON array of role IDs */
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             # Messages table with FTS support
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id BIGINT PRIMARY KEY,
                     message_id BIGINT,
-                    channel_id BIGINT,
-                    channel_name TEXT,
-                    author_id BIGINT,
-                    author_name TEXT,
-                    author_discriminator TEXT,
-                    author_avatar_url TEXT,
+                    channel_id BIGINT NOT NULL,
+                    author_id BIGINT NOT NULL,
                     content TEXT,
                     created_at TEXT,
                     attachments TEXT,
                     embeds TEXT,
-                    reactions TEXT,
+                    reaction_count INTEGER,
+                    reactors TEXT,
                     reference_id BIGINT,
                     edited_at TEXT,
                     is_pinned BOOLEAN,
@@ -53,7 +115,9 @@ class DatabaseHandler:
                     message_type TEXT,
                     flags INTEGER,
                     jump_url TEXT,
-                    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (author_id) REFERENCES members(id),
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
                 )
             """)
             
@@ -63,32 +127,6 @@ class DatabaseHandler:
                     content,
                     content='messages',
                     content_rowid='id'
-                )
-            """)
-            
-            # Channel summaries table
-            self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS daily_summaries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    channel_name TEXT NOT NULL,
-                    message_count INTEGER NOT NULL,
-                    raw_messages TEXT NOT NULL,
-                    full_summary TEXT,
-                    short_summary TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(date, channel_id) ON CONFLICT REPLACE
-                )
-            """)
-            
-            # Channel summary threads table
-            self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS channel_summary (
-                    channel_id BIGINT PRIMARY KEY,
-                    summary_thread_id BIGINT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -110,7 +148,8 @@ class DatabaseHandler:
             ("idx_author_id", "messages(author_id)"),
             ("idx_reference_id", "messages(reference_id)"),
             ("idx_daily_summaries_date", "daily_summaries(date)"),
-            ("idx_daily_summaries_channel", "daily_summaries(channel_id)")
+            ("idx_daily_summaries_channel", "daily_summaries(channel_id)"),
+            ("idx_members_username", "members(username)")
         ]
         
         for index_name, index_def in indexes:
@@ -125,8 +164,12 @@ class DatabaseHandler:
     def store_messages(self, messages: List[Dict]):
         """Store messages in database, skipping duplicates."""
         try:
+            # Debug log the message format
+            if messages:
+                logger.debug(f"First message format: {json.dumps(messages[0], default=str)}")
+            
             # First check which messages already exist
-            message_ids = [msg['message_id'] for msg in messages]
+            message_ids = [msg.get('message_id') or msg.get('id') for msg in messages]  # Handle both ID formats
             placeholders = ','.join('?' * len(message_ids))
             
             self.cursor.execute(f"""
@@ -136,7 +179,7 @@ class DatabaseHandler:
             """, message_ids)
             
             existing_ids = {row[0] for row in self.cursor.fetchall()}
-            new_messages = [msg for msg in messages if msg['message_id'] not in existing_ids]
+            new_messages = [msg for msg in messages if (msg.get('message_id') or msg.get('id')) not in existing_ids]
             
             if not new_messages:
                 logger.debug("No new messages to store - all messages already exist")
@@ -144,42 +187,82 @@ class DatabaseHandler:
             
             # Insert only new messages
             for message in new_messages:
-                self.cursor.execute("""
-                    INSERT INTO messages 
-                    (id, message_id, channel_id, channel_name, author_id, author_name, 
-                     author_discriminator, author_avatar_url, content, created_at, 
-                     attachments, embeds, reactions, reference_id, edited_at,
-                     is_pinned, thread_id, message_type, flags, jump_url)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    message['id'],
-                    message['message_id'],
-                    message['channel_id'],
-                    message.get('channel_name'),
-                    message['author_id'],
-                    message['author_name'],
-                    message.get('author_discriminator'),
-                    message.get('author_avatar_url'),
-                    message['content'],
-                    message['created_at'],
-                    json.dumps(message['attachments']),
-                    json.dumps(message['embeds']),
-                    json.dumps(message['reactions']),
-                    message['reference_id'],
-                    message['edited_at'],
-                    message['is_pinned'],
-                    message['thread_id'],
-                    message['message_type'],
-                    message['flags'],
-                    message.get('jump_url')
-                ))
-                
-                # Update FTS index
-                if message['content']:
+                try:
+                    # Debug log each message being processed
+                    logger.debug(f"Processing message: {json.dumps(message, default=str)}")
+                    
+                    # First create or update the member
+                    if 'author' in message:
+                        author = message['author']
+                        self.create_or_update_member(
+                            member_id=author.get('id'),
+                            username=author.get('name') or author.get('username'),
+                            display_name=author.get('display_name'),
+                            global_name=author.get('global_name'),
+                            avatar_url=author.get('avatar_url'),
+                            discriminator=author.get('discriminator'),
+                            bot=author.get('bot', False),
+                            system=author.get('system', False),
+                            accent_color=author.get('accent_color'),
+                            banner_url=author.get('banner_url'),
+                            discord_created_at=author.get('discord_created_at'),
+                            guild_join_date=author.get('guild_join_date'),
+                            role_ids=author.get('role_ids')
+                        )
+
+                    # Then create or update the channel
+                    if 'channel' in message:
+                        channel = message['channel']
+                        self.create_or_update_channel(
+                            channel_id=channel.get('id'),
+                            channel_name=channel.get('name'),
+                            nsfw=channel.get('nsfw', False)
+                        )
+                    
+                    # Ensure all fields are properly serialized
+                    attachments_json = json.dumps(message.get('attachments', []))
+                    embeds_json = json.dumps(message.get('embeds', []))
+                    reactors_json = json.dumps(message.get('reactors', []))
+                    created_at = message.get('created_at')
+                    if created_at:
+                        created_at = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
+                    edited_at = message.get('edited_at')
+                    if edited_at:
+                        edited_at = edited_at.isoformat() if hasattr(edited_at, 'isoformat') else str(edited_at)
+                    
+                    # Use either message_id or id
+                    message_id = message.get('message_id') or message.get('id')
+                    
                     self.cursor.execute("""
-                        INSERT OR REPLACE INTO messages_fts(rowid, content)
-                        VALUES (?, ?)
-                    """, (message['id'], message['content']))
+                        INSERT INTO messages 
+                        (id, message_id, channel_id, author_id,
+                         content, created_at, attachments, embeds, reaction_count, 
+                         reactors, reference_id, edited_at, is_pinned, thread_id, 
+                         message_type, flags, jump_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        message_id,  # Use same ID for both fields since we don't have a separate internal ID
+                        message_id,
+                        message.get('channel_id'),
+                        message.get('author_id') or (message.get('author', {}).get('id')),
+                        message.get('content'),
+                        created_at,
+                        attachments_json,
+                        embeds_json,
+                        message.get('reaction_count', 0),
+                        reactors_json,
+                        message.get('reference_id'),
+                        edited_at,
+                        message.get('is_pinned', False),
+                        message.get('thread_id'),
+                        message.get('message_type'),
+                        message.get('flags', 0),
+                        message.get('jump_url')
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing individual message: {e}")
+                    logger.debug(f"Problem message: {json.dumps(message, default=str)}")
+                    continue
             
             self.conn.commit()
             logger.debug(f"Stored {len(new_messages)} new messages (skipped {len(existing_ids)} duplicates)")
@@ -247,22 +330,20 @@ class DatabaseHandler:
             date = datetime.utcnow().date()
             
         try:
+            # First create or update the channel record
+            self.create_or_update_channel(channel_id, channel_name)
+            
             # Convert messages to serializable format
             messages_data = []
             for msg in messages:
                 message_dict = {
-                    'content': msg.content,
-                    'author': msg.author.name,
-                    'timestamp': msg.created_at.isoformat(),
-                    'jump_url': msg.jump_url,
-                    'reactions': sum(reaction.count for reaction in msg.reactions) if msg.reactions else 0,
-                    'id': str(msg.id),
-                    'attachments': [
-                        {
-                            'filename': attachment.filename,
-                            'url': attachment.url
-                        } for attachment in msg.attachments
-                    ]
+                    'content': msg['content'],
+                    'author': msg['author'],
+                    'timestamp': msg['timestamp'],  # Already ISO format
+                    'jump_url': msg['jump_url'],
+                    'reactions': msg['reactions'],
+                    'id': msg['id'],
+                    'attachments': msg['attachments']
                 }
                 messages_data.append(message_dict)
             
@@ -270,13 +351,12 @@ class DatabaseHandler:
             
             self.cursor.execute("""
                 INSERT OR REPLACE INTO daily_summaries 
-                (date, channel_id, channel_name, message_count, raw_messages, 
+                (date, channel_id, message_count, raw_messages, 
                  full_summary, short_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                date.isoformat(),
+                date.isoformat() if isinstance(date, datetime) else date,  # Ensure date is ISO format
                 channel_id,
-                channel_name,
                 len(messages),
                 messages_json,
                 full_summary,
@@ -388,3 +468,147 @@ class DatabaseHandler:
             logger.error(f"Database error executing query: {query}\nError: {e}")
             self.conn.rollback()
             raise
+
+    def get_member(self, member_id: int) -> Optional[Dict]:
+        """Get a member by their ID."""
+        try:
+            self.cursor.execute("""
+                SELECT id, username, server_nick, global_name, avatar_url, discriminator,
+                       bot, system, accent_color, banner_url, discord_created_at,
+                       guild_join_date, role_ids, created_at, updated_at
+                FROM members
+                WHERE id = ?
+            """, (member_id,))
+            result = self.cursor.fetchone()
+            if result:
+                return {
+                    'id': result[0],
+                    'username': result[1],
+                    'server_nick': result[2],
+                    'global_name': result[3],
+                    'avatar_url': result[4],
+                    'discriminator': result[5],
+                    'bot': bool(result[6]),
+                    'system': bool(result[7]),
+                    'accent_color': result[8],
+                    'banner_url': result[9],
+                    'discord_created_at': result[10],
+                    'guild_join_date': result[11],
+                    'role_ids': result[12],
+                    'created_at': result[13],
+                    'updated_at': result[14]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting member {member_id}: {e}")
+            return None
+
+    def create_or_update_member(self, member_id: int, username: str, display_name: Optional[str] = None, 
+                              global_name: Optional[str] = None, avatar_url: Optional[str] = None,
+                              discriminator: Optional[str] = None, bot: bool = False, 
+                              system: bool = False, accent_color: Optional[int] = None,
+                              banner_url: Optional[str] = None, discord_created_at: Optional[str] = None,
+                              guild_join_date: Optional[str] = None, role_ids: Optional[str] = None) -> bool:
+        """Create or update a member in the database."""
+        try:
+            existing_member = self.get_member(member_id)
+            if existing_member:
+                # Update existing member if any field changed
+                if (existing_member['username'] != username or 
+                    existing_member['server_nick'] != display_name or
+                    existing_member['global_name'] != global_name or
+                    existing_member['avatar_url'] != avatar_url or
+                    existing_member['discriminator'] != discriminator or
+                    existing_member['bot'] != bot or
+                    existing_member['system'] != system or
+                    existing_member['accent_color'] != accent_color or
+                    existing_member['banner_url'] != banner_url or
+                    existing_member['discord_created_at'] != discord_created_at or
+                    existing_member['guild_join_date'] != guild_join_date or
+                    existing_member['role_ids'] != role_ids):
+                    self.cursor.execute("""
+                        UPDATE members
+                        SET username = ?, server_nick = ?, global_name = ?, avatar_url = ?, 
+                            discriminator = ?, bot = ?, system = ?, accent_color = ?,
+                            banner_url = ?, discord_created_at = ?, guild_join_date = ?, 
+                            role_ids = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (username, display_name, global_name, avatar_url, 
+                          discriminator, bot, system, accent_color,
+                          banner_url, discord_created_at, guild_join_date,
+                          role_ids, member_id))
+            else:
+                # Create new member
+                self.cursor.execute("""
+                    INSERT INTO members 
+                    (id, username, server_nick, global_name, avatar_url, 
+                     discriminator, bot, system, accent_color, banner_url, 
+                     discord_created_at, guild_join_date, role_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (member_id, username, display_name, global_name, avatar_url,
+                      discriminator, bot, system, accent_color, banner_url,
+                      discord_created_at, guild_join_date, role_ids))
+            
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating/updating member {member_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_channel(self, channel_id: int) -> Optional[Dict]:
+        """Get a channel by its ID."""
+        try:
+            self.cursor.execute("""
+                SELECT channel_id, channel_name, description, suitable_posts, 
+                       unsuitable_posts, rules, setup_complete, nsfw, enriched
+                FROM channels
+                WHERE channel_id = ?
+            """, (channel_id,))
+            result = self.cursor.fetchone()
+            if result:
+                return {
+                    'channel_id': result[0],
+                    'channel_name': result[1],
+                    'description': result[2],
+                    'suitable_posts': result[3],
+                    'unsuitable_posts': result[4],
+                    'rules': result[5],
+                    'setup_complete': bool(result[6]),
+                    'nsfw': bool(result[7]),
+                    'enriched': bool(result[8])
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting channel {channel_id}: {e}")
+            return None
+
+    def create_or_update_channel(self, channel_id: int, channel_name: str, 
+                               nsfw: bool = False) -> bool:
+        """Create or update a channel in the database."""
+        try:
+            existing_channel = self.get_channel(channel_id)
+            if existing_channel:
+                # Update if name or nsfw status changed
+                if (existing_channel['channel_name'] != channel_name or
+                    existing_channel['nsfw'] != nsfw):
+                    self.cursor.execute("""
+                        UPDATE channels
+                        SET channel_name = ?, nsfw = ?
+                        WHERE channel_id = ?
+                    """, (channel_name, nsfw, channel_id))
+            else:
+                # Create new channel
+                self.cursor.execute("""
+                    INSERT INTO channels 
+                    (channel_id, channel_name, description, suitable_posts, 
+                     unsuitable_posts, rules, setup_complete, nsfw, enriched)
+                    VALUES (?, ?, '', '', '', '', FALSE, ?, FALSE)
+                """, (channel_id, channel_name, nsfw))
+            
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating/updating channel {channel_id}: {e}")
+            self.conn.rollback()
+            return False

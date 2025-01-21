@@ -7,7 +7,7 @@ import traceback
 from src.common.log_handler import LogHandler
 
 class ArtCurator(commands.Bot):
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, dev_mode=False):
         # Setup intents
         intents = discord.Intents.default()
         intents.message_content = True
@@ -27,7 +27,7 @@ class ArtCurator(commands.Bot):
         self.curator_ids = []
         
         # Set initial dev mode (this will trigger the setter to load correct IDs)
-        self.dev_mode = False
+        self.dev_mode = dev_mode
         
         # Add a set to track curators currently in rejection flow
         self._active_rejections = set()

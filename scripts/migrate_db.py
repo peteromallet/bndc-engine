@@ -1,13 +1,14 @@
 import os
 import sys
 import time
+import argparse
 # Add project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sqlite3
 import logging
 from typing import List, Set, Dict
-from src.common.constants import DATABASE_PATH
+from src.common.constants import get_database_path
 from src.common.schema import get_schema_tuples
 
 logging.basicConfig(level=logging.INFO)
@@ -119,11 +120,15 @@ def create_temp_table_and_migrate_data(cursor, desired_schema: List[tuple], exis
         cursor.execute(f"ALTER TABLE {backup_name} RENAME TO messages")
         raise
 
-def migrate_database():
+def migrate_database(dev_mode: bool = False):
     conn = None
     try:
+        # Get appropriate database path
+        db_path = get_database_path(dev_mode)
+        logger.info(f"Using database at: {db_path}")
+        
         # Connect to the database
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(db_path)
         conn.execute("BEGIN TRANSACTION")  # Explicit transaction
         cursor = conn.cursor()
 
@@ -180,5 +185,114 @@ def migrate_database():
         if conn:
             conn.close()
 
+def migrate_daily_summaries(cursor):
+    """Migrate daily_summaries table to use channels table."""
+    logger.info("Starting daily_summaries migration")
+    
+    try:
+        # First check if channel_name column exists
+        cursor.execute("PRAGMA table_info(daily_summaries)")
+        columns = {col[1]: col for col in cursor.fetchall()}
+        
+        if 'channel_name' not in columns:
+            logger.info("daily_summaries table already migrated")
+            return
+            
+        # Get original row count
+        cursor.execute("SELECT COUNT(*) FROM daily_summaries")
+        original_count = cursor.fetchone()[0]
+        
+        # Create backup
+        backup_name = backup_table(cursor, "daily_summaries")
+        logger.info(f"Created backup table: {backup_name}")
+        
+        try:
+            # First ensure all channels exist in channels table
+            cursor.execute("SELECT DISTINCT channel_id, channel_name FROM daily_summaries")
+            channels = cursor.fetchall()
+            
+            for channel_id, channel_name in channels:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO channels 
+                    (channel_id, channel_name, setup_complete)
+                    VALUES (?, ?, TRUE)
+                """, (channel_id, channel_name))
+            
+            # Create new table without channel_name
+            cursor.execute("""
+                CREATE TABLE daily_summaries_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    raw_messages TEXT NOT NULL,
+                    full_summary TEXT,
+                    short_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, channel_id) ON CONFLICT REPLACE,
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+                )
+            """)
+            
+            # Copy data to new table
+            cursor.execute("""
+                INSERT INTO daily_summaries_new 
+                (id, date, channel_id, message_count, raw_messages, 
+                 full_summary, short_summary, created_at)
+                SELECT 
+                    id, date, channel_id, message_count, raw_messages,
+                    full_summary, short_summary, created_at
+                FROM daily_summaries
+            """)
+            
+            # Validate before dropping old table
+            cursor.execute("SELECT COUNT(*) FROM daily_summaries_new")
+            if cursor.fetchone()[0] != original_count:
+                raise ValueError("Row count mismatch before table swap")
+            
+            # Drop old table and rename new one
+            cursor.execute("DROP TABLE daily_summaries")
+            cursor.execute("ALTER TABLE daily_summaries_new RENAME TO daily_summaries")
+            
+            logger.info("Successfully migrated daily_summaries table")
+            
+        except Exception as e:
+            # If anything goes wrong, we can restore from backup
+            logger.error(f"Migration failed: {e}")
+            cursor.execute("DROP TABLE IF EXISTS daily_summaries")
+            cursor.execute(f"ALTER TABLE {backup_name} RENAME TO daily_summaries")
+            raise
+            
+    except Exception as e:
+        logger.error(f"Error during daily_summaries migration: {e}")
+        raise
+
+def main():
+    """Main migration function."""
+    try:
+        logger.info("Starting database migration")
+        
+        # Connect to database
+        db_path = get_database_path()
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Run migrations
+        migrate_daily_summaries(cursor)
+        
+        # Commit changes
+        conn.commit()
+        logger.info("Migration completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        if 'conn' in locals():
+            conn.rollback()
+        raise
+        
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 if __name__ == "__main__":
-    migrate_database() 
+    main() 

@@ -1,0 +1,268 @@
+import discord
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import json
+
+from src.common.db_handler import DatabaseHandler
+from dotenv import load_dotenv
+
+logger = logging.getLogger('MessageLogger')
+
+class MessageLogger(discord.Client):
+    def __init__(self, dev_mode=False):
+        # Set up discord client with necessary intents
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.reactions = True  # Add reactions intent
+        super().__init__(intents=intents)
+        
+        # Initialize database connection with dev mode
+        self.db = DatabaseHandler(dev_mode=dev_mode)
+        
+        # Set dev mode
+        self.dev_mode = dev_mode
+        
+        # Load environment variables
+        load_dotenv()
+        
+        # Load bot user ID
+        self.bot_user_id = int(os.getenv('BOT_USER_ID'))
+        
+        # Channels to skip
+        self.skip_channels = {1076117621407223832}  # Welcome channel
+        
+        # Set up logging
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(handler)
+        
+    async def setup_hook(self):
+        """Setup hook to initialize any necessary resources."""
+        logger.info("Message logger initialized and ready")
+        
+    def _prepare_message_data(self, message: discord.Message) -> Dict[str, Any]:
+        """Convert a discord message into a format suitable for database storage."""
+        try:
+            # Calculate total reaction count
+            reaction_count = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+            
+            # More defensive thread_id handling with logging
+            thread_id = None
+            try:
+                if hasattr(message, 'thread') and message.thread:
+                    thread_id = message.thread.id
+                    logger.debug(f"Found thread_id {thread_id} for message {message.id}")
+                elif message.channel and isinstance(message.channel, discord.Thread):
+                    thread_id = message.channel.id
+                    logger.debug(f"Message {message.id} is in thread {thread_id}")
+            except Exception as e:
+                logger.debug(f"Error getting thread_id for message {message.id}: {e}")
+            
+            # Get guild display name (nickname) if available
+            display_name = None  # Only set if there's a server nickname
+            global_name = message.author.global_name
+            try:
+                if hasattr(message, 'guild') and message.guild:
+                    member = message.guild.get_member(message.author.id)
+                    if member:
+                        display_name = member.nick  # Only use the server nickname
+            except Exception as e:
+                logger.debug(f"Error getting display name for user {message.author.id}: {e}")
+            
+            return {
+                'id': message.id,
+                'message_id': message.id,
+                'channel_id': message.channel.id,
+                'channel_name': message.channel.name,
+                'author_id': message.author.id,
+                'author_name': message.author.name,
+                'author_discriminator': message.author.discriminator,
+                'author_avatar_url': str(message.author.avatar.url) if message.author.avatar else None,
+                'content': message.content,
+                'created_at': message.created_at.isoformat(),
+                'attachments': [
+                    {
+                        'url': attachment.url,
+                        'filename': attachment.filename
+                    } for attachment in message.attachments
+                ],
+                'embeds': [embed.to_dict() for embed in message.embeds],
+                'reaction_count': reaction_count,
+                'reactors': None,  # We don't populate reactors at message creation time
+                'reference_id': message.reference.message_id if message.reference else None,
+                'edited_at': message.edited_at.isoformat() if message.edited_at else None,
+                'is_pinned': message.pinned,
+                'thread_id': thread_id,
+                'message_type': str(message.type),
+                'flags': message.flags.value,
+                'jump_url': message.jump_url,
+                'display_name': display_name,  # Server nickname or display name
+                'global_name': global_name  # Global display name
+            }
+        except Exception as e:
+            logger.error(f"Error preparing message data: {e}")
+            raise
+
+    async def on_ready(self):
+        """Called when the client is ready."""
+        logger.info(f"Logged in as {self.user.name} ({self.user.id})")
+        logger.info(f"Connected to {len(self.guilds)} guilds")
+
+    async def on_message(self, message: discord.Message):
+        """Called when a message is sent in any channel the bot can see."""
+        try:
+            # Ignore messages from the bot itself or the configured bot user
+            if message.author == self.user or message.author.id == self.bot_user_id:
+                return
+                
+            # Skip welcome channel
+            if message.channel.id in self.skip_channels:
+                return
+                
+            # Prepare and store the message
+            message_data = self._prepare_message_data(message)
+            self.db.store_messages([message_data])
+            
+            logger.debug(f"Logged message {message.id} from {message.author.name} in #{message.channel.name}")
+            
+        except Exception as e:
+            logger.error(f"Error logging message: {e}")
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Called when a message is edited."""
+        try:
+            # Ignore edits from the bot itself or the configured bot user
+            if after.author == self.user or after.author.id == self.bot_user_id:
+                return
+                
+            # Skip welcome channel
+            if after.channel.id in self.skip_channels:
+                return
+                
+            # Prepare and store the edited message
+            message_data = self._prepare_message_data(after)
+            self.db.store_messages([message_data])
+            
+            logger.debug(f"Logged edited message {after.id} from {after.author.name} in #{after.channel.name}")
+            
+        except Exception as e:
+            logger.error(f"Error logging edited message: {e}")
+
+    async def on_message_delete(self, message: discord.Message):
+        """Called when a message is deleted."""
+        # Note: We don't delete from the database, but you could add this functionality if needed
+        logger.info(f"Message {message.id} was deleted from #{message.channel.name}")
+
+    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
+        """Called when a reaction is added to a message."""
+        try:
+            # Ignore reactions from the bot itself
+            if user == self.user or user.id == self.bot_user_id:
+                return
+
+            # Skip welcome channel
+            if reaction.message.channel.id in self.skip_channels:
+                return
+
+            # Get current message data from database
+            results = self.db.execute_query("""
+                SELECT reaction_count, reactors
+                FROM messages
+                WHERE message_id = ?
+            """, (reaction.message.id,))
+
+            if not results:
+                logger.warning(f"Message {reaction.message.id} not found in database for reaction update")
+                return
+
+            current_count = results[0][0] or 0  # Default to 0 if None
+            current_reactors_json = results[0][1]
+            current_reactors = json.loads(current_reactors_json) if current_reactors_json else []
+
+            # Add new reactor if not already in list
+            if user.id not in current_reactors:
+                current_reactors.append(user.id)
+
+            # Update database with new count and reactors
+            self.db.execute_query("""
+                UPDATE messages
+                SET reaction_count = ?, reactors = ?
+                WHERE message_id = ?
+            """, (current_count + 1, json.dumps(current_reactors), reaction.message.id))
+
+            logger.debug(f"Added reaction from {user.name} to message {reaction.message.id}")
+
+        except Exception as e:
+            logger.error(f"Error handling reaction add: {e}")
+
+    async def on_reaction_remove(self, reaction: discord.Reaction, user: discord.User):
+        """Called when a reaction is removed from a message."""
+        try:
+            # Ignore reactions from the bot itself
+            if user == self.user or user.id == self.bot_user_id:
+                return
+
+            # Get current message data from database
+            results = self.db.execute_query("""
+                SELECT reaction_count, reactors
+                FROM messages
+                WHERE message_id = ?
+            """, (reaction.message.id,))
+
+            if not results:
+                logger.warning(f"Message {reaction.message.id} not found in database for reaction update")
+                return
+
+            current_count, current_reactors_json = results[0]
+            current_reactors = json.loads(current_reactors_json) if current_reactors_json else []
+
+            # Remove reactor from list if present
+            if user.id in current_reactors:
+                current_reactors.remove(user.id)
+
+            # Update database with new count and reactors
+            self.db.execute_query("""
+                UPDATE messages
+                SET reaction_count = ?, reactors = ?
+                WHERE message_id = ?
+            """, (max(0, current_count - 1), json.dumps(current_reactors), reaction.message.id))
+
+            logger.debug(f"Removed reaction from {user.name} on message {reaction.message.id}")
+
+        except Exception as e:
+            logger.error(f"Error handling reaction remove: {e}")
+
+    def run_logger(self):
+        """Run the message logger."""
+        try:
+            token = os.getenv('DISCORD_BOT_TOKEN')
+            if not token:
+                raise ValueError("DISCORD_BOT_TOKEN not found in environment variables")
+                
+            logger.info("Starting message logger...")
+            super().run(token)
+            
+        except Exception as e:
+            logger.error(f"Error running message logger: {e}")
+            raise
+        finally:
+            if hasattr(self, 'db'):
+                self.db.close()
+
+def main():
+    """Main entry point for running the message logger."""
+    try:
+        message_logger = MessageLogger()
+        message_logger.run_logger()
+    except Exception as e:
+        logger.error(f"Failed to start message logger: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()

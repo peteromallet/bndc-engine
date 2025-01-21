@@ -10,6 +10,7 @@ import time
 
 from src.features.curation.curator import ArtCurator
 from src.features.summarisation.summarizer import ChannelSummarizer
+from src.features.logging.logging import MessageLogger
 from src.common.log_handler import LogHandler
 
 def setup_logging(dev_mode=False):
@@ -160,27 +161,61 @@ async def cleanup_tasks(tasks):
             except asyncio.CancelledError:
                 pass
 
-async def run_all_bots(curator_bot, summarizer_bot, token, run_now, logger):
-    """Run both bots concurrently"""
+async def run_logger(bot, token):
+    """Run the message logger bot"""
     try:
-        # Create tasks for both bots
+        # Create task for bot connection
+        bot_task = asyncio.create_task(bot.start(token))
+        
+        # Wait for bot to be ready
+        start_time = time.time()
+        while not bot.is_ready():
+            if time.time() - start_time > READY_TIMEOUT:
+                raise TimeoutError("Logger bot failed to become ready within timeout period")
+            await asyncio.sleep(1)
+            
+        bot.logger.info("Logger bot is ready and fully connected")
+            
+        # Wait for the bot task to complete or be cancelled
+        await bot_task
+            
+    except Exception as e:
+        bot.logger.error(f"Error running logger bot: {e}")
+        traceback.print_exc()
+        raise
+
+async def run_all_bots(curator_bot, summarizer_bot, logger_bot, token, run_now, logger):
+    """Run all bots concurrently"""
+    try:
+        # Create tasks for all bots
         curator_task = asyncio.create_task(
             run_curator(curator_bot, token)
         )
         summarizer_task = asyncio.create_task(
             run_summarizer(summarizer_bot, token, run_now)
         )
+        logger_task = asyncio.create_task(
+            run_logger(logger_bot, token)
+        )
         
         curator_bot.logger.info("Starting curator bot")
         summarizer_bot.logger.info("Starting summarizer bot")
+        logger_bot.logger.info("Starting logger bot")
         
-        # Wait for either task to complete (or fail)
+        # Wait for logger bot to be ready
+        start_time = time.time()
+        while not logger_bot.is_ready():
+            if time.time() - start_time > READY_TIMEOUT:
+                raise TimeoutError("Logger bot failed to become ready within timeout period")
+            await asyncio.sleep(1)
+            
+        # Wait for any task to complete (or fail)
         done, pending = await asyncio.wait(
-            [curator_task, summarizer_task],
+            [curator_task, summarizer_task, logger_task],
             return_when=asyncio.FIRST_COMPLETED
         )
         
-        # If one bot fails, cancel the other and raise the exception
+        # If one bot fails, cancel the others and raise the exception
         for task in done:
             try:
                 await task
@@ -195,6 +230,7 @@ async def run_all_bots(curator_bot, summarizer_bot, token, run_now, logger):
     except Exception as e:
         curator_bot.logger.error(f"Error in bot operation: {e}")
         summarizer_bot.logger.error(f"Error in bot operation: {e}")
+        logger_bot.logger.error(f"Error in bot operation: {e}")
         raise
 
 def main():
@@ -207,13 +243,15 @@ def main():
     # Load environment variables
     load_dotenv()
     
-    # Setup shared logging for both bots
+    # Setup shared logging for all bots
     logger = setup_logging(args.dev)
     logger.info("Starting bot initialization")
     
-    # Create and configure both bots with shared logger
-    curator_bot = ArtCurator(logger=logger)
-    summarizer_bot = ChannelSummarizer(logger=logger)
+    # Create and configure all bots with shared logger and dev mode
+    curator_bot = ArtCurator(logger=logger, dev_mode=args.dev)
+    summarizer_bot = ChannelSummarizer(logger=logger, dev_mode=args.dev)
+    logger_bot = MessageLogger(dev_mode=args.dev)
+    logger_bot.logger = logger  # Use shared logger
     
     # Set dev mode if specified
     if args.dev:
@@ -234,10 +272,11 @@ def main():
         
         logger.info("Configuration loaded successfully, starting bots")
         
-        # Run both bots
+        # Run all bots
         asyncio.run(run_all_bots(
             curator_bot,
             summarizer_bot,
+            logger_bot,
             token,
             args.summary_now,
             logger
