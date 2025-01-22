@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import argparse
 
 # Add project root to Python path
@@ -161,95 +161,107 @@ class NewsSummarizer:
             logger.error(f"Error checking database content: {e}")
             logger.error(traceback.format_exc())
 
-    def get_channel_messages(self, channel_id: int):
+    def get_channel_messages(self, channel_id: Optional[int] = None) -> List[dict]:
         """Get messages from the past 24 hours from the database."""
         logger.info("Getting all messages from database for past 24 hours")
         
         try:
-            # First get total count
-            count_query = """
-                SELECT COUNT(*)
-                FROM messages m
-                WHERE m.created_at > datetime('now', '-1 day')
-            """
-            total_count = self.db.execute_query(count_query)[0][0]
-            logger.info(f"Found total of {total_count} messages in database for past 24 hours")
+            # Build the query based on whether a channel_id is provided
+            channel_condition = "AND m.channel_id = ?" if channel_id else ""
+            params = (channel_id,) if channel_id else ()
             
-            # Query messages from database
-            query = """
-                SELECT m.*, mem.username, mem.server_nick, mem.global_name,
-                       m.content, m.attachments, m.reaction_count, m.reactors, m.jump_url
+            query = f"""
+                SELECT 
+                    m.message_id, m.channel_id, m.author_id, m.content,
+                    m.created_at, m.attachments, m.embeds, m.reaction_count,
+                    m.reactors, m.reference_id, m.edited_at, m.is_pinned,
+                    m.thread_id, m.message_type, m.flags, m.jump_url,
+                    m.indexed_at,
+                    mem.username, mem.server_nick, mem.global_name
                 FROM messages m
-                LEFT JOIN members mem ON m.author_id = mem.id
+                LEFT JOIN members mem ON m.author_id = mem.member_id
                 WHERE m.created_at > datetime('now', '-1 day')
+                {channel_condition}
                 ORDER BY m.created_at DESC
             """
             
-            logger.info("Executing query for all channels")
-            results = self.db.execute_query(query)
-            logger.info(f"Query returned {len(results)} rows")
-            
-            # Debug: Print first few messages to see what we're getting
-            for i, row in enumerate(results[:3]):
-                logger.info(f"\nDEBUG - Raw message {i+1}:")
-                logger.info(f"Content: {row[4]}")
-                logger.info(f"Attachments: {row[6]}")
-                logger.info(f"Reactions: {row[7]}")
-                logger.info(f"Reactors: {row[8]}")
-                logger.info(f"Jump URL: {row[16]}")
-                logger.info(f"Author: {row[19] or row[20] or row[18]}")  # server_nick, global_name, username
-            
+            results = self.db.execute_query(query, params)
             messages = []
+            
             for row in results:
                 try:
-                    # Create a message-like object with the fields we need
+                    # Handle timezone-aware datetime strings
+                    created_at = row[4]
+                    if created_at:
+                        created_at = created_at.replace('Z', '+00:00')
+                        created_at = datetime.fromisoformat(created_at)
+                    else:
+                        created_at = datetime.utcnow()
+
+                    edited_at = row[10]
+                    if edited_at:
+                        edited_at = edited_at.replace('Z', '+00:00')
+                        edited_at = datetime.fromisoformat(edited_at)
+
+                    indexed_at = row[16]
+                    if indexed_at:
+                        indexed_at = datetime.fromisoformat(indexed_at.replace('Z', '+00:00'))
+
+                    # Safely parse JSON fields
+                    try:
+                        attachments = json.loads(row[5]) if row[5] and row[5] != '[]' else []
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid attachments JSON for message {row[0]}: {row[5]}")
+                        attachments = []
+
+                    try:
+                        embeds = json.loads(row[6]) if row[6] and row[6] != '[]' else []
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid embeds JSON for message {row[0]}: {row[6]}")
+                        embeds = []
+
+                    try:
+                        reactors = json.loads(row[8]) if row[8] and row[8] != '[]' else []
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid reactors JSON for message {row[0]}: {row[8]}")
+                        reactors = []
+
+                    # Convert database row to message dict format
                     message = {
-                        'id': row[0],
-                        'message_id': row[1],
-                        'channel_id': row[2],
-                        'author_id': row[3],
-                        'content': row[4],
-                        'created_at': datetime.fromisoformat(row[5]),
-                        'attachments': json.loads(row[6]) if row[6] else [],
-                        'reaction_count': row[8],
-                        'reactors': json.loads(row[9]) if row[9] else [],
-                        'jump_url': row[16],
-                        'author_name': row[19] or row[20] or row[18]  # server_nick, global_name, username
+                        'message_id': row[0],
+                        'channel_id': row[1],
+                        'author_id': row[2],
+                        'content': row[3] or '',  # Ensure content is never None
+                        'created_at': created_at,
+                        'attachments': attachments,
+                        'embeds': embeds,
+                        'reaction_count': row[7] or 0,
+                        'reactors': reactors,
+                        'reference_id': row[9],  # Keep as is for reply chains
+                        'edited_at': edited_at,
+                        'is_pinned': bool(row[11]),
+                        'thread_id': row[12],
+                        'message_type': row[13].replace('MessageType.', '') if row[13] else 'default',
+                        'flags': row[14] or 0,
+                        'jump_url': row[15],
+                        'indexed_at': indexed_at,
+                        'author_name': row[19] or row[18] or row[17] or 'Unknown User'
                     }
                     messages.append(message)
-                    
-                    # Debug: Print the processed message object
-                    if len(messages) <= 3:
-                        logger.info(f"\nDEBUG - Processed message {len(messages)}:")
-                        logger.info(f"Content: {message['content']}")
-                        logger.info(f"Attachments: {message['attachments']}")
-                        logger.info(f"Reactions: {message['reaction_count']}")
-                        logger.info(f"Reactors: {message['reactors']}")
-                        logger.info(f"Author: {message['author_name']}")
-                        
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Error processing message {row[0]}: {e}")
+                    continue
                 except Exception as e:
-                    logger.error(f"Error processing message row: {e}")
-                    logger.error(f"Raw row data: {row}")
+                    logger.error(f"Error processing message {row[0]}: {e}")
+                    logger.error(traceback.format_exc())
                     continue
             
-            logger.info(f"Successfully processed {len(messages)} messages from database for channel {channel_id}")
-            
-            # Debug: Print what we're sending to Claude
-            if messages:
-                logger.info("\nDEBUG - Sample of what will be sent to Claude:")
-                sample_msg = messages[0]
-                formatted = f"=== Message from {sample_msg['author_name']} ===\n"
-                formatted += f"Content: {sample_msg['content']}\n"
-                formatted += f"Reactions: {sample_msg['reaction_count']}\n"
-                formatted += f"Attachments: {sample_msg['attachments']}\n"
-                formatted += f"Jump URL: {sample_msg['jump_url']}\n"
-                logger.info(formatted)
-            
+            logger.info(f"Retrieved {len(messages)} messages from database")
             return messages
             
         except Exception as e:
             logger.error(f"Error getting messages from database: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(traceback.format_exc())
             return []
 
     def format_messages_for_claude(self, messages):
@@ -518,132 +530,97 @@ Here are the messages to analyze:
         
         return chunks
 
-    def format_news_for_discord(self, news_items_json: str) -> str:
-        """Format JSON news items into Discord markdown."""
+    def format_news_for_discord(self, news_items_json: str) -> List[dict]:
+        """Format JSON news items into Discord markdown, returning a list of messages to send."""
         try:
             if news_items_json == "[NO SIGNIFICANT NEWS]" or news_items_json == "[NO MESSAGES TO ANALYZE]":
-                return news_items_json
+                return [{"content": news_items_json}]
                 
             news_items = json.loads(news_items_json)
-            formatted_content = []
+            messages_to_send = []
             
             for item in news_items:
-                # Add main topic header
-                formatted_content.append(f"## {item['title']}\n")
-                
-                # Add main text and message link
-                formatted_content.append(f"{item['mainText']}")
-                formatted_content.append(f"💬 Original message: {item['messageLink']}\n")
+                # Start with main topic header and text
+                main_content = [
+                    f"## {item['title']}\n",
+                    f"{item['mainText']} (💬: {item['messageLink']})\n"
+                ]
+                messages_to_send.append({"content": "\n".join(main_content)})
                 
                 # Add main files if they exist and aren't placeholders
                 if 'mainFile' in item and not item['mainFile'].startswith('⁠'):
-                    # Split multiple files and add each on a new line
+                    # Split multiple files and add each as a separate message
                     files = [f.strip() for f in item['mainFile'].split(',')]
                     for file in files:
-                        formatted_content.append(f"📎 {file}")
-                    formatted_content.append("")  # Add empty line after files
+                        messages_to_send.append({"content": f"📎 {file}"})
                 
                 # Add subtopics
                 if 'subTopics' in item and item['subTopics']:
                     for subtopic in item['subTopics']:
                         # Start with bullet point and text
-                        content = [f"• {subtopic['text']}"]
+                        content = []
+                        
+                        # Add text and message link together
+                        if 'messageLink' in subtopic:
+                            content.append(f"• {subtopic['text']} (💬: {subtopic['messageLink']})")
+                        else:
+                            content.append(f"• {subtopic['text']}")
+                            
+                        messages_to_send.append({"content": "\n".join(content)})
                         
                         # Add files if they exist and aren't placeholders
                         if 'file' in subtopic and not subtopic['file'].startswith('⁠'):
                             files = [f.strip() for f in subtopic['file'].split(',')]
                             for file in files:
-                                content.append(f"  📎 {file}")
+                                messages_to_send.append({"content": f"  📎 {file}"})
                         
                         # Add link if it exists and isn't a placeholder
                         if 'link' in subtopic and not subtopic['link'].startswith('⁠'):
-                            content.append(f"  🔗 {subtopic['link']}")
-                        
-                        # Add message link
-                        if 'messageLink' in subtopic:
-                            content.append(f"  💬 {subtopic['messageLink']}")
-                            
-                        formatted_content.append("\n".join(content))
-                        formatted_content.append("")  # Add empty line between subtopics
-                
-                # Add separator between topics
-                formatted_content.append("---\n")
+                            messages_to_send.append({"content": f"  🔗 {subtopic['link']}"})
             
-            return '\n'.join(formatted_content)
+            return messages_to_send
             
         except json.JSONDecodeError:
             # If it's not JSON, return as is
-            return news_items_json
+            return [{"content": news_items_json}]
         except Exception as e:
             logger.error(f"Error formatting news items: {e}")
             logger.error(traceback.format_exc())
-            return news_items_json
+            return [{"content": news_items_json}]
 
-    async def post_to_discord(self, news_items):
+    async def post_to_discord(self, news_items, target_channel=None):
         """Post news items to Discord using bot client."""
         try:
-            for channel_id in self.channel_ids:
-                channel = self.discord_client.get_channel(channel_id)
+            # If target_channel is provided, use it directly
+            channels_to_post = [target_channel] if target_channel else [self.discord_client.get_channel(cid) for cid in self.channel_ids]
+            
+            for channel in channels_to_post:
                 if not channel:
-                    logger.error(f"Could not find channel with ID {channel_id}")
+                    logger.error(f"Could not find channel")
                     continue
                     
-                if news_items == "[NO SIGNIFICANT NEWS]":
-                    await self.safe_send_message(channel, "No significant news in the past 24 hours.")
-                    continue
-
-                # Parse JSON if needed
                 if isinstance(news_items, str):
-                    if news_items == "[NO MESSAGES TO ANALYZE]":
-                        await self.safe_send_message(channel, news_items)
-                        continue
-                    news_items = json.loads(news_items)
+                    # Convert string input into list of messages format
+                    if news_items == "[NO SIGNIFICANT NEWS]":
+                        messages = [{"content": "No significant news in the past 24 hours."}]
+                    elif news_items == "[NO MESSAGES TO ANALYZE]":
+                        messages = [{"content": news_items}]
+                    else:
+                        # Split into chunks if needed (Discord has 2000 char limit)
+                        messages = [{"content": chunk} for chunk in news_items.split('\n\n') if chunk.strip()]
+                elif isinstance(news_items, list):
+                    messages = news_items
+                else:
+                    logger.error(f"Unexpected news_items type: {type(news_items)}")
+                    raise ValueError(f"Unexpected news_items type: {type(news_items)}")
 
-                # Process each news item
-                for item in news_items:
-                    # Send header
-                    await self.safe_send_message(channel, f"## {item['title']}")
-                    await asyncio.sleep(1)
-                    
-                    # Send main text
-                    await self.safe_send_message(channel, item['mainText'])
-                    await asyncio.sleep(1)
-                    
-                    # Send main files if they exist and aren't placeholders
-                    if 'mainFile' in item and not item['mainFile'].startswith('⁠'):
-                        # Split and send each file URL separately
-                        files = [f.strip() for f in item['mainFile'].split(',')]
-                        for file in files:
-                            if file:  # Only send if not empty
-                                await self.safe_send_message(channel, f"🔗 {file}")
-                                await asyncio.sleep(1)
-                    
-                    # Process subtopics
-                    if 'subTopics' in item and item['subTopics']:
-                        for subtopic in item['subTopics']:
-                            # Send subtopic text with message link
-                            await self.safe_send_message(channel, f"• {subtopic['text']}: {subtopic['messageLink']}")
-                            await asyncio.sleep(1)
-                            
-                            # Send subtopic files if they exist and aren't placeholders
-                            if 'file' in subtopic and not subtopic['file'].startswith('⁠'):
-                                # Split and send each file URL separately
-                                files = [f.strip() for f in subtopic['file'].split(',')]
-                                for file in files:
-                                    if file:  # Only send if not empty
-                                        await self.safe_send_message(channel, f"  🔗 {file}")
-                                        await asyncio.sleep(1)
-                                        
-                            # Send subtopic link if it exists and isn't a placeholder
-                            if 'link' in subtopic and not subtopic['link'].startswith('⁠'):
-                                await self.safe_send_message(channel, f"  🔗 {subtopic['link']}")
-                                await asyncio.sleep(1)
-                    
-                    # Add separator between topics
-                    await self.safe_send_message(channel, "---")
-                    await asyncio.sleep(1)
+                # Send each message one at a time
+                for msg in messages:
+                    if msg.get("content", "").strip():
+                        await self.safe_send_message(channel, msg["content"])
+                        await asyncio.sleep(1)
                 
-                logger.info(f"Successfully sent all news items to channel {channel_id}")
+                logger.info(f"Successfully sent all news items to channel {channel.id}")
                 
         except Exception as e:
             logger.error(f"Error posting to Discord: {e}")
@@ -680,8 +657,8 @@ Here are the messages to analyze:
         
         try:
             logger.info("Getting all messages from past 24 hours")
-            messages = self.get_channel_messages(None)  # channel_id is no longer used
-            logger.info(f"Retrieved {len(messages)} messages total")
+            messages = self.get_channel_messages(None)  # None to get all channels
+            logger.info(f"Retrieved {len(messages)} messages from database")
 
             if messages:
                 logger.info(f"Generating summary for {len(messages)} messages...")

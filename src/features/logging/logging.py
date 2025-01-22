@@ -31,8 +31,16 @@ class MessageLogger(discord.Client):
         # Load bot user ID
         self.bot_user_id = int(os.getenv('BOT_USER_ID'))
         
-        # Channels to skip
-        self.skip_channels = {1076117621407223832}  # Welcome channel
+        # Load monitored channels based on dev mode
+        if dev_mode:
+            dev_channels = os.getenv('DEV_CHANNELS_TO_MONITOR', '').strip()
+            self.skip_channels = {int(id) for id in dev_channels.split(',') if id}
+            self.skip_channels.add(1076117621407223832)  # Welcome channel
+            logger.info(f"Dev mode: Monitoring all channels EXCEPT {self.skip_channels}")
+        else:
+            # In production, monitor all channels except welcome
+            self.skip_channels = {1076117621407223832}  # Welcome channel
+            logger.info("Production mode: Monitoring all channels except welcome")
         
         # Set up logging
         logger.setLevel(logging.INFO)
@@ -102,6 +110,7 @@ class MessageLogger(discord.Client):
                 'message_type': str(message.type),
                 'flags': message.flags.value,
                 'jump_url': message.jump_url,
+                'is_deleted': False,  # Messages are not deleted when first created
                 'display_name': display_name,  # Server nickname or display name
                 'global_name': global_name  # Global display name
             }
@@ -121,7 +130,7 @@ class MessageLogger(discord.Client):
             if message.author == self.user or message.author.id == self.bot_user_id:
                 return
                 
-            # Skip welcome channel
+            # Skip configured channels
             if message.channel.id in self.skip_channels:
                 return
                 
@@ -141,7 +150,7 @@ class MessageLogger(discord.Client):
             if after.author == self.user or after.author.id == self.bot_user_id:
                 return
                 
-            # Skip welcome channel
+            # Skip configured channels
             if after.channel.id in self.skip_channels:
                 return
                 
@@ -156,8 +165,27 @@ class MessageLogger(discord.Client):
 
     async def on_message_delete(self, message: discord.Message):
         """Called when a message is deleted."""
-        # Note: We don't delete from the database, but you could add this functionality if needed
-        logger.info(f"Message {message.id} was deleted from #{message.channel.name}")
+        try:
+            # Skip configured channels
+            if message.channel.id in self.skip_channels:
+                return
+
+            # Check if message exists first
+            result = self.db.execute_query("""
+                SELECT 1 FROM messages WHERE message_id = ?
+            """, (message.id,))
+
+            if result:
+                # Update the message in the database to mark it as deleted
+                self.db.execute_query("""
+                    UPDATE messages 
+                    SET is_deleted = TRUE 
+                    WHERE message_id = ?
+                """, (message.id,))
+                logger.debug(f"Message {message.id} marked as deleted")
+            
+        except Exception as e:
+            logger.error(f"Error handling message deletion: {e}")
 
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
         """Called when a reaction is added to a message."""
@@ -166,7 +194,7 @@ class MessageLogger(discord.Client):
             if user == self.user or user.id == self.bot_user_id:
                 return
 
-            # Skip welcome channel
+            # Skip configured channels
             if reaction.message.channel.id in self.skip_channels:
                 return
 

@@ -14,13 +14,13 @@ class RateLimiter:
         self.jitter = 0.1        # Random jitter factor
         self.logger = logging.getLogger('ChannelSummarizer')  # Initialize logger
     
-    async def execute(self, key, coroutine):
+    async def execute(self, key, coroutine_or_factory):
         """
-        Executes a coroutine with rate limit handling.
+        Executes a coroutine or coroutine factory with rate limit handling.
         
         Args:
             key: Identifier for the rate limit (e.g., channel_id)
-            coroutine: The coroutine to execute
+            coroutine_or_factory: The coroutine or factory function to execute
             
         Returns:
             The result of the coroutine execution
@@ -34,6 +34,12 @@ class RateLimiter:
                 if key in self.backoff_times:
                     jitter = random.uniform(-self.jitter, self.jitter)
                     await asyncio.sleep(self.backoff_times[key] * (1 + jitter))
+                
+                # If it's a factory function, call it to get the coroutine
+                if callable(coroutine_or_factory) and not asyncio.iscoroutine(coroutine_or_factory):
+                    coroutine = coroutine_or_factory()
+                else:
+                    coroutine = coroutine_or_factory
                 
                 result = await coroutine
                 

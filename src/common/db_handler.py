@@ -97,8 +97,7 @@ class DatabaseHandler:
             # Messages table with FTS support
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
-                    id BIGINT PRIMARY KEY,
-                    message_id BIGINT,
+                    message_id BIGINT PRIMARY KEY,
                     channel_id BIGINT NOT NULL,
                     author_id BIGINT NOT NULL,
                     content TEXT,
@@ -125,7 +124,7 @@ class DatabaseHandler:
                 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
                     content,
                     content='messages',
-                    content_rowid='id'
+                    content_rowid='message_id'
                 )
             """)
             
@@ -161,67 +160,35 @@ class DatabaseHandler:
 
     # Message Archive Methods
     def store_messages(self, messages: List[Dict]):
-        """Store messages in database, skipping duplicates."""
+        """Store messages in the database."""
         try:
-            # Debug log the message format
-            if messages:
-                logger.debug(f"First message format: {json.dumps(messages[0], default=str)}")
-            
-            # First check which messages already exist
-            message_ids = [msg.get('message_id') or msg.get('id') for msg in messages]  # Handle both ID formats
-            placeholders = ','.join('?' * len(message_ids))
-            
-            self.cursor.execute(f"""
-                SELECT message_id 
-                FROM messages 
-                WHERE message_id IN ({placeholders})
-            """, message_ids)
-            
-            existing_ids = {row[0] for row in self.cursor.fetchall()}
-            new_messages = [msg for msg in messages if (msg.get('message_id') or msg.get('id')) not in existing_ids]
-            
-            if not new_messages:
-                logger.debug("No new messages to store - all messages already exist")
-                return
-            
-            # Insert only new messages
-            for message in new_messages:
+            for message in messages:
                 try:
-                    # Debug log each message being processed
-                    logger.debug(f"Processing message: {json.dumps(message, default=str)}")
-                    
-                    # First create or update the member
-                    if 'author' in message:
-                        author = message['author']
-                        self.create_or_update_member(
-                            member_id=author.get('id'),
-                            username=author.get('name') or author.get('username'),
-                            display_name=author.get('display_name'),
-                            global_name=author.get('global_name'),
-                            avatar_url=author.get('avatar_url'),
-                            discriminator=author.get('discriminator'),
-                            bot=author.get('bot', False),
-                            system=author.get('system', False),
-                            accent_color=author.get('accent_color'),
-                            banner_url=author.get('banner_url'),
-                            discord_created_at=author.get('discord_created_at'),
-                            guild_join_date=author.get('guild_join_date'),
-                            role_ids=author.get('role_ids')
-                        )
-
-                    # Then create or update the channel
-                    if 'channel' in message:
-                        channel = message['channel']
-                        self.create_or_update_channel(
-                            channel_id=channel.get('id'),
-                            channel_name=channel.get('name'),
-                            nsfw=channel.get('nsfw', False)
-                        )
+                    # Get and validate message ID
+                    message_id = message.get('message_id')
+                    if message_id is None:
+                        # Fall back to 'id' if message_id isn't present
+                        message_id = message.get('id')
+                        if message_id is None:
+                            raise ValueError("Message must have either 'message_id' or 'id' field")
                     
                     # Ensure all fields are properly serialized
-                    attachments_json = json.dumps(message.get('attachments', []) if isinstance(message.get('attachments'), (list, dict)) else json.loads(message.get('attachments', '[]')))
-                    embeds_json = json.dumps(message.get('embeds', []) if isinstance(message.get('embeds'), (list, dict)) else json.loads(message.get('embeds', '[]')))
-                    reactors_json = json.dumps(message.get('reactors', []) if isinstance(message.get('reactors'), (list, dict)) else json.loads(message.get('reactors', '[]')))
+                    attachments = message.get('attachments', [])
+                    embeds = message.get('embeds', [])
+                    reactors = message.get('reactors', [])
+                    
+                    # Convert to empty lists if None or 'null'
+                    if attachments is None or attachments == 'null':
+                        attachments = []
+                    if embeds is None or embeds == 'null':
+                        embeds = []
+                    if reactors is None or reactors == 'null':
+                        reactors = []
+                    
+                    attachments_json = json.dumps(attachments if isinstance(attachments, (list, dict)) else [])
+                    embeds_json = json.dumps(embeds if isinstance(embeds, (list, dict)) else [])
+                    reactors_json = json.dumps(reactors if isinstance(reactors, (list, dict)) else [])
+                    
                     created_at = message.get('created_at')
                     if created_at:
                         created_at = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
@@ -229,19 +196,15 @@ class DatabaseHandler:
                     if edited_at:
                         edited_at = edited_at.isoformat() if hasattr(edited_at, 'isoformat') else str(edited_at)
                     
-                    # Use either message_id or id
-                    message_id = message.get('message_id') or message.get('id')
-                    
                     self.cursor.execute("""
                         INSERT INTO messages 
-                        (id, message_id, channel_id, author_id,
+                        (message_id, channel_id, author_id,
                          content, created_at, attachments, embeds, reaction_count, 
                          reactors, reference_id, edited_at, is_pinned, thread_id, 
                          message_type, flags, jump_url)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        message_id,  # Use same ID for both fields since we don't have a separate internal ID
-                        message_id,
+                        message_id,  # Use Discord's message ID as primary key
                         message.get('channel_id'),
                         message.get('author_id') or (message.get('author', {}).get('id')),
                         message.get('content'),
@@ -264,7 +227,7 @@ class DatabaseHandler:
                     continue
             
             self.conn.commit()
-            logger.debug(f"Stored {len(new_messages)} new messages (skipped {len(existing_ids)} duplicates)")
+            logger.debug(f"Stored {len(messages)} messages")
             
         except Exception as e:
             logger.error(f"Error storing messages: {e}")
@@ -274,7 +237,7 @@ class DatabaseHandler:
     def get_last_message_id(self, channel_id: int) -> Optional[int]:
         """Get the ID of the last archived message for a channel."""
         self.cursor.execute("""
-            SELECT MAX(id) FROM messages WHERE channel_id = ?
+            SELECT MAX(message_id) FROM messages WHERE channel_id = ?
         """, (channel_id,))
         result = self.cursor.fetchone()
         return result[0] if result and result[0] else None
@@ -285,7 +248,7 @@ class DatabaseHandler:
             sql = """
                 SELECT m.*
                 FROM messages_fts fts
-                JOIN messages m ON fts.rowid = m.id
+                JOIN messages m ON fts.rowid = m.message_id
                 WHERE fts.content MATCH ?
             """
             params = [query]
@@ -300,16 +263,22 @@ class DatabaseHandler:
             rows = self.cursor.fetchall()
             
             return [{
-                'id': row[0],
+                'message_id': row[0],
                 'channel_id': row[1],
                 'author_id': row[2],
-                'author_name': row[3],
                 'content': row[4],
                 'created_at': row[5],
                 'attachments': json.loads(row[6]),
-                'reactions': json.loads(row[8]),
-                'reference_id': row[9],
-                'thread_id': row[12]
+                'embeds': json.loads(row[7]),
+                'reaction_count': row[8],
+                'reactors': json.loads(row[9]),
+                'reference_id': row[10],
+                'edited_at': row[11],
+                'is_pinned': bool(row[12]),
+                'thread_id': row[13],
+                'message_type': row[14],
+                'flags': row[15],
+                'jump_url': row[16]
             } for row in rows]
             
         except Exception as e:
@@ -594,3 +563,45 @@ class DatabaseHandler:
             logger.error(f"Error creating/updating channel {channel_id}: {e}")
             self.conn.rollback()
             return False
+
+    def get_messages_after(self, date: datetime) -> List[Dict]:
+        """Get all messages after a specific date."""
+        try:
+            self.cursor.execute("""
+                SELECT message_id, channel_id, author_id, content, created_at, 
+                       attachments, embeds, reaction_count, reactors, reference_id, 
+                       edited_at, is_pinned, thread_id, message_type, flags, jump_url
+                FROM messages 
+                WHERE created_at > ?
+                ORDER BY created_at DESC
+            """, (date.isoformat(),))
+            
+            rows = self.cursor.fetchall()
+            messages = []
+            
+            for row in rows:
+                message = {
+                    'message_id': row[0],
+                    'channel_id': row[1],
+                    'author_id': row[2],
+                    'content': row[3],
+                    'created_at': row[4],
+                    'attachments': json.loads(row[5]) if row[5] else [],
+                    'embeds': json.loads(row[6]) if row[6] else [],
+                    'reaction_count': row[7],
+                    'reactors': json.loads(row[8]) if row[8] else [],
+                    'reference_id': row[9],
+                    'edited_at': row[10],
+                    'is_pinned': bool(row[11]),
+                    'thread_id': row[12],
+                    'message_type': row[13],
+                    'flags': row[14],
+                    'jump_url': row[15]
+                }
+                messages.append(message)
+            
+            return messages
+            
+        except Exception as e:
+            logger.error(f"Error getting messages after {date}: {e}")
+            return []

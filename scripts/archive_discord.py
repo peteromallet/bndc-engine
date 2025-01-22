@@ -569,10 +569,11 @@ class MessageArchiver(commands.Bot):
         try:
             message_start_time = datetime.now()
             
-            # Calculate total reaction count and get reactors if count >= 3
+            # Calculate total reaction count and get reactors
             reaction_count = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
-            reactors = None
-            if reaction_count >= 3 and message.reactions:
+            reactors = []  # Always initialize as empty list
+            
+            if reaction_count > 0 and message.reactions:
                 reaction_start_time = datetime.now()
                 reactor_ids = set()
                 try:
@@ -580,56 +581,55 @@ class MessageArchiver(commands.Bot):
                     
                     guild = self.get_guild(self.guild_id)
                     
-                    for reaction in message.reactions[:5]:
-                        if reaction.count >= 3:
-                            reaction_process_start = datetime.now()
-                            await self._wait_for_rate_limit()
-                            try:
-                                async for user in reaction.users(limit=50):
-                                    reactor_ids.add(user.id)
-                                    if hasattr(user, 'id') and not self.db.get_member(user.id):
-                                        logger.debug(f"Fetching new member info for reactor {user.id}")
-                                        await self._wait_for_rate_limit()
-                                        member = guild.get_member(user.id) if guild else None
-                                        role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
-                                        guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
+                    for reaction in message.reactions:
+                        reaction_process_start = datetime.now()
+                        await self._wait_for_rate_limit()
+                        try:
+                            async for user in reaction.users(limit=50):
+                                reactor_ids.add(user.id)
+                                if hasattr(user, 'id') and not self.db.get_member(user.id):
+                                    logger.debug(f"Fetching new member info for reactor {user.id}")
+                                    await self._wait_for_rate_limit()
+                                    member = guild.get_member(user.id) if guild else None
+                                    role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
+                                    guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
 
-                                        self.db.create_or_update_member(
-                                            member_id=user.id,
-                                            username=user.name,
-                                            display_name=getattr(user, 'display_name', None),
-                                            global_name=getattr(user, 'global_name', None),
-                                            avatar_url=str(user.avatar.url) if user.avatar else None,
-                                            discriminator=getattr(user, 'discriminator', None),
-                                            bot=getattr(user, 'bot', False),
-                                            system=getattr(user, 'system', False),
-                                            accent_color=getattr(user, 'accent_color', None),
-                                            banner_url=str(user.banner.url) if getattr(user, 'banner', None) else None,
-                                            discord_created_at=user.created_at.isoformat() if hasattr(user, 'created_at') else None,
-                                            guild_join_date=guild_join_date,
-                                            role_ids=role_ids
-                                        )
-                                    else:
-                                        logger.debug(f"Using cached member info for reactor {user.id}")
-                                        
-                                reaction_process_duration = (datetime.now() - reaction_process_start).total_seconds()
-                                logger.info(f"Processed reaction {reaction} in {reaction_process_duration:.2f}s")
-                            except discord.Forbidden:
-                                logger.warning(f"Missing permissions to fetch reactors for {reaction} on message {message.id}")
-                                continue
-                            except Exception as e:
-                                logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
-                                continue
+                                    self.db.create_or_update_member(
+                                        member_id=user.id,
+                                        username=user.name,
+                                        display_name=getattr(user, 'display_name', None),
+                                        global_name=getattr(user, 'global_name', None),
+                                        avatar_url=str(user.avatar.url) if user.avatar else None,
+                                        discriminator=getattr(user, 'discriminator', None),
+                                        bot=getattr(user, 'bot', False),
+                                        system=getattr(user, 'system', False),
+                                        accent_color=getattr(user, 'accent_color', None),
+                                        banner_url=str(user.banner.url) if getattr(user, 'banner', None) else None,
+                                        discord_created_at=user.created_at.isoformat() if hasattr(user, 'created_at') else None,
+                                        guild_join_date=guild_join_date,
+                                        role_ids=role_ids
+                                    )
+                                else:
+                                    logger.debug(f"Using cached member info for reactor {user.id}")
+                                    
+                            reaction_process_duration = (datetime.now() - reaction_process_start).total_seconds()
+                            logger.info(f"Processed reaction {reaction} in {reaction_process_duration:.2f}s")
+                        except discord.Forbidden:
+                            logger.warning(f"Missing permissions to fetch reactors for {reaction} on message {message.id}")
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
+                            continue
                     
                     reaction_duration = (datetime.now() - reaction_start_time).total_seconds()
                     if reaction_duration > 2.0:  # Log slow reaction processing
                         logger.warning(f"Slow reaction processing for message {message.id}: {reaction_duration:.2f}s")
                     
-                    # Only set reactors if we actually found some
-                    reactors = list(reactor_ids) if reactor_ids else None
+                    # Convert reactor_ids to list if we found any
+                    if reactor_ids:
+                        reactors = list(reactor_ids)
                 except Exception as e:
                     logger.warning(f"Could not fetch reactors for message {message.id}: {e}")
-                    reactors = None
                 
             # First create or update the member
             if hasattr(message.author, 'id'):
@@ -710,7 +710,7 @@ class MessageArchiver(commands.Bot):
                 ],
                 'embeds': [embed.to_dict() for embed in message.embeds],
                 'reaction_count': reaction_count,
-                'reactors': reactors,  # This will be None or a list, not a JSON string
+                'reactors': reactors,  # This will be a list, not None
                 'reference_id': message.reference.message_id if message.reference else None,
                 'edited_at': message.edited_at.isoformat() if message.edited_at else None,
                 'is_pinned': message.pinned,
