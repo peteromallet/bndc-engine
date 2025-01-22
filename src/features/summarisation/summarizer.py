@@ -1189,7 +1189,7 @@ Full summary to work from:
                     return
                 
                 daily_header = "# Daily Summary - Tuesday, January 21, 2025"
-                await self.safe_send_message(summary_channel, daily_header)
+                first_message = await self.safe_send_message(summary_channel, daily_header)
 
                 # Decide which channels to check for data
                 # In dev mode, we'll gather messages from the TEST_DATA_CHANNEL for summarizing,
@@ -1324,6 +1324,11 @@ Full summary to work from:
 
                     # (iv) Post top gens in that thread
                     await self.post_top_gens_for_channel(thread, channel_id)
+
+                # Add link back to the start of today's summary
+                if first_message:
+                    link_to_start = f"https://discord.com/channels/{first_message.guild.id}/{first_message.channel.id}/{first_message.id}"
+                    await self.safe_send_message(summary_channel, f"\n***Click here to jump to the beginning of today's summary: {link_to_start}***")
 
         except Exception as e:
             self.logger.error(f"Critical error in summary generation: {e}")
