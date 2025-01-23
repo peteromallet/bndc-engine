@@ -68,7 +68,8 @@ def get_desired_members_schema() -> List[tuple]:
         ("guild_join_date", "TEXT"),
         ("role_ids", "TEXT"),  # JSON array of role IDs
         ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-        ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ("notifications", "TEXT DEFAULT '[]'")
     ]
 
 def get_desired_daily_summaries_schema() -> List[tuple]:
@@ -337,7 +338,7 @@ def migrate_members_table(cursor):
                 SELECT member_id, username, global_name, server_nick,
                        avatar_url, discriminator, bot, system, accent_color,
                        banner_url, discord_created_at, guild_join_date, role_ids,
-                       created_at, updated_at
+                       created_at, updated_at, '[]' as notifications
                 FROM members
             """)
             

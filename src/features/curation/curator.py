@@ -5,6 +5,9 @@ import os
 import logging
 import traceback
 from src.common.log_handler import LogHandler
+import json
+from src.common.db_handler import DatabaseHandler
+import datetime
 
 class ArtCurator(commands.Bot):
     def __init__(self, logger=None, dev_mode=False):
@@ -16,7 +19,12 @@ class ArtCurator(commands.Bot):
         intents.guilds = True
         intents.emojis = True
 
-        super().__init__(command_prefix='!', intents=intents)
+        # Create bot with admin permissions
+        super().__init__(
+            command_prefix='!',
+            intents=intents,
+            permissions=discord.Permissions(administrator=True)
+        )
         
         # Setup logger
         self.logger = logger or logging.getLogger('ArtCurator')
@@ -31,6 +39,9 @@ class ArtCurator(commands.Bot):
         
         # Add a set to track curators currently in rejection flow
         self._active_rejections = set()
+        
+        # Get BOT_USER_ID from environment
+        self.bot_user_id = int(os.getenv('BOT_USER_ID', 0))
         
         # Register event handlers
         self.setup_events()
@@ -112,7 +123,13 @@ class ArtCurator(commands.Bot):
                 if self.dev_mode:
                     self.logger.debug(f"Found links in message: {links}")
                 
-                # Check if any of the links are from allowed domains
+                # Check if all links are from allowed domains
+                all_links_allowed = all(
+                    any(domain in link.lower() for domain in allowed_domains)
+                    for link in links
+                ) if links else True  # True if no links present
+
+                # Check if any of the links are from allowed domains (for reaction purposes)
                 has_valid_link = any(
                     domain in link.lower() 
                     for domain in allowed_domains 
@@ -121,67 +138,62 @@ class ArtCurator(commands.Bot):
 
                 if self.dev_mode:
                     self.logger.debug(f"Message has valid link: {has_valid_link}")
+                    self.logger.debug(f"All links are allowed: {all_links_allowed}")
 
-                # Only delete if there's no valid content at all
-                if not (has_valid_attachment or has_valid_link):
-                    has_invalid_links = bool(links)
-                    
-                    try:
-                        await message.delete()
-                        self.logger.info(f"Deleted message from {message.author} in channel {message.channel.id} due to invalid content.")
-                    except discord.Forbidden:
-                        self.logger.error(f"Permission denied: Couldn't delete message from {message.author}.")
-                    except Exception as e:
-                        self.logger.error(f"Error deleting message: {e}", exc_info=True)
-                    
-                    try:
-                        if has_invalid_links:
-                            await message.author.send(
-                                f"Hi <@{message.author.id}>,\n\n"
-                                "Your message in the art channel was deleted because it contained links "
-                                "but none were from platforms that Discord can embed. Please make sure to "
-                                "include either media files or links from supported platforms.\n\n"
-                                "If you'd like to ask a question about or comment on a specific piece, "
-                                "please use the thread under that post."
-                            )
-                        else:
-                            await message.author.send(
-                                f"Hi <@{message.author.id}>,\n\n"
-                                "Your message in the art channel was deleted because it didn't contain "
-                                "a valid image/video file or a link from a platform that Discord can embed.\n\n"
-                                "If you'd like to ask a question about or comment on a specific piece, "
-                                "please use the thread under that post."
-                            )
-                        self.logger.info(f"Sent deletion reason DM to {message.author}.")
-                    except discord.Forbidden:
-                        self.logger.warning(f"Couldn't DM user {message.author}")
-                    except Exception as e:
-                        self.logger.error(f"Error sending DM to {message.author}: {e}", exc_info=True)
-                    return
-
-                # If post contains both a file and links, suppress embeds
-                if has_valid_attachment and links:
+                # If there are any links and not all are from allowed domains, suppress embeds
+                if links and not all_links_allowed:
                     try:
                         await message.edit(suppress=True)
-                        self.logger.info(f"Suppressed embeds for message from {message.author}.")
+                        self.logger.info(f"Suppressed embeds for message from {message.author} - contains non-video links.")
+                        
+                        # Check if user has already received the notification
+                        try:
+                            member = await message.guild.fetch_member(message.author.id)
+                            if member:
+                                # Get member's notifications from database
+                                db = DatabaseHandler(dev_mode=self.dev_mode)
+                                member_data = db.get_member(member.id)
+                                notifications = json.loads(member_data.get('notifications', '[]')) if member_data else []
+                                
+                                if 'no_art_share_link' not in notifications:
+                                    # Send notification message
+                                    notification_msg = (
+                                        f"Hi {message.author.mention},\n\n"
+                                        "You posted a link to art sharing that didn't seem like it would embed a video on Discord. "
+                                        "For the sake of the Discord viewing experience, we hide these.\n\n"
+                                        "If you meant to post a video, please share a link to a platform that embeds links on Discord (YT, etc.) or a file "
+                                        "- alongside a non-embedding link if you like!\n\n"
+                                        "Love,\n\nBNDC"
+                                    )
+                                    try:
+                                        await message.author.send(notification_msg)
+                                        self.logger.info(f"Sent non-video link notification to {message.author}")
+                                        
+                                        # Add notification to user's list
+                                        notifications.append('no_art_share_link')
+                                        db.execute_query(
+                                            "UPDATE members SET notifications = ? WHERE member_id = ?",
+                                            (json.dumps(notifications), member.id)
+                                        )
+                                        db.conn.commit()
+                                    except discord.Forbidden:
+                                        self.logger.warning(f"Could not send DM to {message.author}")
+                                db.close()
+                        except Exception as e:
+                            self.logger.error(f"Error handling notification for {message.author}: {e}")
+                            
                     except discord.Forbidden:
                         self.logger.error("Bot doesn't have permission to edit messages.")
                     except Exception as e:
                         self.logger.error(f"Error editing message: {e}", exc_info=True)
 
-                # Try to create thread
-                try:
-                    thread = await message.create_thread(
-                        name=f"Discussion: {message.author.display_name}'s Art",
-                        auto_archive_duration=10080  # Archives after 1 week of inactivity
-                    )
-                    self.logger.info(f"Created thread for message from {message.author}.")
-                    
-                    # Add message about tagging the author
-                    await thread.send(f"Make sure to tag <@{message.author.id}> in messages to make sure they see your comment!")
-                    self.logger.info(f"Added tagging reminder message to thread.")
-                except Exception as e:
-                    self.logger.error(f"Error creating thread: {e}", exc_info=True)
+                # Add reaction if the message has valid content
+                if has_valid_attachment or has_valid_link:
+                    try:
+                        await message.add_reaction('💌')
+                        self.logger.info(f"Added love letter box reaction to message from {message.author}.")
+                    except Exception as e:
+                        self.logger.error(f"Error adding reaction: {e}", exc_info=True)
 
             # Process commands after handling the message
             await self.process_commands(message)
@@ -196,9 +208,86 @@ class ArtCurator(commands.Bot):
             if self.dev_mode:
                 self.logger.debug(f"Raw reaction event received: {payload.emoji}")
             
-            # Check if reaction is X and in art channel
-            if (str(payload.emoji) in ['❌', '𝕏', 'X', '🇽'] and 
+            # Check if reaction is love letter box and in art channel
+            if (str(payload.emoji) == '💌' and 
                 payload.channel_id == self.art_channel_id):
+                
+                # Log the reaction details in dev mode
+                if self.dev_mode:
+                    self.logger.debug(f"Love letter reaction - Reactor ID: {payload.user_id}, Bot ID: {self.user.id}")
+                
+                # Skip if reaction is from any bot
+                if payload.user_id == self.user.id:
+                    self.logger.info("Ignoring bot's own reaction")
+                    return
+                
+                self.logger.info(f"Love letter box reaction received in art channel from user {payload.user_id}")
+                
+                # Get the channel and message
+                channel = self.get_channel(payload.channel_id)
+                if channel is None:
+                    self.logger.error(f"Channel with ID {payload.channel_id} not found.")
+                    return
+                try:
+                    message = await channel.fetch_message(payload.message_id)
+                    
+                    # Create thread if one doesn't exist
+                    if not message.thread:
+                        self.logger.info("No existing thread found, creating new thread...")
+                        thread = await message.create_thread(
+                            name=f"Discussion: {message.author.display_name}'s Art",
+                            auto_archive_duration=10080  # Archives after 1 week of inactivity
+                        )
+                        self.logger.info(f"Created thread {thread.id} for message {message.id}")
+                        
+                        # Delete the system message about thread creation
+                        try:
+                            # Wait a moment for the system message to appear
+                            await asyncio.sleep(2)
+                            
+                            # Get the message directly from the parent channel, just like test script
+                            self.logger.info(f"Attempting to fetch system message from parent channel {channel.name} ({channel.id})")
+                            async for msg in channel.history(limit=5):
+                                if msg.type == discord.MessageType.thread_created and msg.id != message.id:
+                                    # Get message details just like test script
+                                    self.logger.info(f"Found message details:")
+                                    self.logger.info(f"  ID: {msg.id}")
+                                    self.logger.info(f"  Author: {msg.author} ({msg.author.id})")
+                                    self.logger.info(f"  Type: {msg.type}")
+                                    self.logger.info(f"  Content: {msg.content}")
+                                    self.logger.info(f"  Created at: {msg.created_at}")
+                                    self.logger.info(f"  Channel: {msg.channel.name} ({msg.channel.id})")
+                                    
+                                    # Check if we should delete this message - same check as test script
+                                    if msg.author.id not in [self.user.id, self.bot_user_id]:
+                                        self.logger.warning(f"Message author {msg.author.id} is not bot or target user - skipping deletion")
+                                        continue
+                                    
+                                    # Try to delete it - same as test script
+                                    self.logger.info("Attempting to delete message...")
+                                    await msg.delete()
+                                    self.logger.info(f"Successfully deleted message {msg.id}")
+                                    break
+                            
+                        except discord.NotFound:
+                            self.logger.error(f"Message not found")
+                        except discord.Forbidden as e:
+                            self.logger.error(f"Forbidden to delete message: {e}")
+                        except Exception as e:
+                            self.logger.error(f"Error deleting message: {e}")
+                            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+                        
+                        # Add message about tagging the author
+                        await thread.send(f"Make sure to tag \@{message.author.name} in messages to make sure they see your comment!")
+                        self.logger.info(f"Added tagging reminder message to thread.")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error creating thread: {e}", exc_info=True)
+                    return
+            
+            # Handle X reaction for curators
+            elif (str(payload.emoji) in ['❌', '𝕏', 'X', '🇽'] and 
+                  payload.channel_id == self.art_channel_id):
                 
                 self.logger.info(f"X reaction received in art channel from user {payload.user_id}")
                 

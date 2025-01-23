@@ -61,11 +61,20 @@ def main():
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=1)
             logger.info(f"Will copy data after: {cutoff_date}")
             
-            # Get messages from the last 24 hours
-            messages = src.execute("""
+            # First get all channels and members
+            channels = src.execute("SELECT channel_id FROM channels").fetchall()
+            channel_ids = {chan[0] for chan in channels}
+            
+            members = src.execute("SELECT member_id FROM members").fetchall()
+            member_ids = {mem[0] for mem in members}
+            
+            # Get messages from the last 24 hours, but only from existing channels and members
+            messages = src.execute(f"""
                 SELECT * FROM messages 
                 WHERE created_at > ?
-            """, (cutoff_date.isoformat(),)).fetchall()
+                AND channel_id IN ({','.join('?' * len(channel_ids))})
+                AND author_id IN ({','.join('?' * len(member_ids))})
+            """, [cutoff_date.isoformat()] + list(channel_ids) + list(member_ids)).fetchall()
             
             if not messages:
                 logger.error("No messages found in the specified time range")
@@ -73,33 +82,33 @@ def main():
                 
             logger.info(f"Found {len(messages)} messages to copy")
             
-            # Get unique channel IDs and member IDs
-            channel_ids = {msg[2] for msg in messages}  # channel_id is at index 2
-            member_ids = {msg[3] for msg in messages}   # author_id is at index 3
+            # Get unique channel IDs and member IDs from the filtered messages
+            message_channel_ids = {msg[1] for msg in messages}  # channel_id is at index 1
+            message_member_ids = {msg[2] for msg in messages}   # author_id is at index 2
             
-            # Copy channels
+            # Copy only the channels we need
             channels = src.execute(f"""
                 SELECT * FROM channels 
-                WHERE channel_id IN ({','.join('?' * len(channel_ids))})
-            """, list(channel_ids)).fetchall()
+                WHERE channel_id IN ({','.join('?' * len(message_channel_ids))})
+            """, list(message_channel_ids)).fetchall()
             
             dst.executemany("""
                 INSERT INTO channels VALUES (?,?,?,?,?,?,?,?,?)
             """, channels)
             logger.info(f"Copied {len(channels)} channels")
             
-            # Copy members
+            # Then copy only the members we need
             members = src.execute(f"""
                 SELECT * FROM members 
-                WHERE id IN ({','.join('?' * len(member_ids))})
-            """, list(member_ids)).fetchall()
+                WHERE member_id IN ({','.join('?' * len(message_member_ids))})
+            """, list(message_member_ids)).fetchall()
             
             dst.executemany("""
                 INSERT INTO members VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, members)
             logger.info(f"Copied {len(members)} members")
             
-            # Copy messages
+            # Finally copy messages
             dst.executemany("""
                 INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, messages)

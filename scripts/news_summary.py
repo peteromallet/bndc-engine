@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 import argparse
+import sqlite3
 
 # Add project root to Python path
 project_root = str(Path(__file__).parent.parent)
@@ -31,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class NewsSummarizer:
-    def __init__(self, dev_mode=False, discord_client=None):
+    def __init__(self, dev_mode=False, discord_client=None, monitored_channels=None):
         logger.info("Initializing NewsSummarizer...")
         
         # Load environment variables
@@ -45,13 +46,28 @@ class NewsSummarizer:
         # Get Discord bot token and channel IDs
         self.discord_token = os.getenv('DISCORD_BOT_TOKEN')
         self.dev_mode = dev_mode
+        self.logger = logger  # Add this line to store logger reference
         
         # Get channel IDs based on mode
         self.channel_ids = []
         if dev_mode:
-            self.channel_ids = [int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))]
+            test_channels = os.getenv('TEST_DATA_CHANNEL')
+            if test_channels:
+                # Split by commas and convert to integers, handling spaces
+                self.channel_ids = [int(cid.strip()) for cid in test_channels.split(',') if cid.strip()]
+                logger.info(f"Dev mode: Using test channels: {self.channel_ids}")
+            else:
+                self.channel_ids = [int(os.getenv('DEV_SUMMARY_CHANNEL_ID'))]
         else:
-            self.channel_ids = [int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))]
+            # Use provided monitored channels if available, otherwise fall back to summary channel
+            if monitored_channels:
+                logger.info(f"[DEBUG] Received monitored_channels: {monitored_channels}")
+                self.channel_ids = monitored_channels
+                logger.info(f"[DEBUG] Set self.channel_ids to: {self.channel_ids}")
+            else:
+                logger.warning("[DEBUG] No monitored_channels provided!")
+                self.channel_ids = [int(os.getenv('PRODUCTION_SUMMARY_CHANNEL_ID'))]
+                logger.info(f"[DEBUG] Using fallback summary channel: {self.channel_ids}")
             
         if not self.discord_token or not all(self.channel_ids):
             raise ValueError("DISCORD_BOT_TOKEN or channel IDs not found in environment")
@@ -166,93 +182,96 @@ class NewsSummarizer:
         logger.info("Getting all messages from database for past 24 hours")
         
         try:
-            # Build the query based on whether a channel_id is provided
-            channel_condition = "AND m.channel_id = ?" if channel_id else ""
-            params = (channel_id,) if channel_id else ()
+            # If channel_id is provided, use it, otherwise use all channel_ids
+            target_channels = [channel_id] if channel_id else self.channel_ids
+            logger.info(f"[DEBUG] self.channel_ids: {self.channel_ids}")
+            logger.info(f"[DEBUG] target_channels: {target_channels}")
             
-            query = f"""
+            if not target_channels:
+                logger.warning("No target channels specified")
+                return []
+
+            # Get messages from all relevant channels
+            query = """
+                WITH monitored_channels AS (
+                    -- Direct channels (not categories)
+                    SELECT c.channel_id, c.channel_name
+                    FROM channels c 
+                    WHERE c.channel_id IN ({})
+                    UNION
+                    -- Channels within monitored categories
+                    SELECT c1.channel_id, c1.channel_name
+                    FROM channels c1 
+                    JOIN channels c2 ON c1.category_id = c2.channel_id
+                    WHERE c2.channel_id IN ({})
+                )
                 SELECT 
                     m.message_id, m.channel_id, m.author_id, m.content,
                     m.created_at, m.attachments, m.embeds, m.reaction_count,
                     m.reactors, m.reference_id, m.edited_at, m.is_pinned,
                     m.thread_id, m.message_type, m.flags, m.jump_url,
                     m.indexed_at,
-                    mem.username, mem.server_nick, mem.global_name
+                    mem.username, mem.server_nick, mem.global_name,
+                    mc.channel_name
                 FROM messages m
                 LEFT JOIN members mem ON m.author_id = mem.member_id
+                JOIN monitored_channels mc ON m.channel_id = mc.channel_id
                 WHERE m.created_at > datetime('now', '-1 day')
-                {channel_condition}
                 ORDER BY m.created_at DESC
+                LIMIT 1000
             """
             
-            results = self.db.execute_query(query, params)
+            channel_list = ','.join(str(cid) for cid in target_channels)
+            formatted_msg_query = query.format(channel_list, channel_list)
+            logger.info(f"[DEBUG] Messages Query: {formatted_msg_query}")
+            
+            # Set row factory to return dictionaries
+            self.db.conn.row_factory = sqlite3.Row
+            cursor = self.db.conn.cursor()
+            cursor.execute(formatted_msg_query)
+            results = cursor.fetchall()
             messages = []
             
             for row in results:
                 try:
                     # Handle timezone-aware datetime strings
-                    created_at = row[4]
-                    if created_at:
-                        created_at = created_at.replace('Z', '+00:00')
-                        created_at = datetime.fromisoformat(created_at)
-                    else:
-                        created_at = datetime.utcnow()
-
-                    edited_at = row[10]
-                    if edited_at:
-                        edited_at = edited_at.replace('Z', '+00:00')
-                        edited_at = datetime.fromisoformat(edited_at)
-
-                    indexed_at = row[16]
-                    if indexed_at:
-                        indexed_at = datetime.fromisoformat(indexed_at.replace('Z', '+00:00'))
-
-                    # Safely parse JSON fields
-                    try:
-                        attachments = json.loads(row[5]) if row[5] and row[5] != '[]' else []
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid attachments JSON for message {row[0]}: {row[5]}")
-                        attachments = []
-
-                    try:
-                        embeds = json.loads(row[6]) if row[6] and row[6] != '[]' else []
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid embeds JSON for message {row[0]}: {row[6]}")
-                        embeds = []
-
-                    try:
-                        reactors = json.loads(row[8]) if row[8] and row[8] != '[]' else []
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid reactors JSON for message {row[0]}: {row[8]}")
-                        reactors = []
-
+                    created_at = row['created_at']
+                    edited_at = row['edited_at']
+                    indexed_at = row['indexed_at']
+                    
+                    # Parse JSON fields
+                    attachments = json.loads(row['attachments']) if row['attachments'] else []
+                    embeds = json.loads(row['embeds']) if row['embeds'] else []
+                    reactors = json.loads(row['reactors']) if row['reactors'] else []
+                    
                     # Convert database row to message dict format
                     message = {
-                        'message_id': row[0],
-                        'channel_id': row[1],
-                        'author_id': row[2],
-                        'content': row[3] or '',  # Ensure content is never None
+                        'message_id': row['message_id'],
+                        'channel_id': row['channel_id'],
+                        'channel_name': row['channel_name'],
+                        'author_id': row['author_id'],
+                        'content': row['content'] or '',  # Ensure content is never None
                         'created_at': created_at,
                         'attachments': attachments,
                         'embeds': embeds,
-                        'reaction_count': row[7] or 0,
+                        'reaction_count': row['reaction_count'] or 0,
                         'reactors': reactors,
-                        'reference_id': row[9],  # Keep as is for reply chains
+                        'reference_id': row['reference_id'],
                         'edited_at': edited_at,
-                        'is_pinned': bool(row[11]),
-                        'thread_id': row[12],
-                        'message_type': row[13].replace('MessageType.', '') if row[13] else 'default',
-                        'flags': row[14] or 0,
-                        'jump_url': row[15],
+                        'is_pinned': bool(row['is_pinned']),
+                        'thread_id': row['thread_id'],
+                        'message_type': row['message_type'].replace('MessageType.', '') if row['message_type'] else 'default',
+                        'flags': row['flags'] or 0,
+                        'jump_url': row['jump_url'],
                         'indexed_at': indexed_at,
-                        'author_name': row[19] or row[18] or row[17] or 'Unknown User'
+                        'author_name': row['server_nick'] or row['global_name'] or row['username'] or 'Unknown User'
                     }
                     messages.append(message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error processing message {row[0]}: {e}")
+                    logger.error(f"Error processing message {row['message_id']}: {e}")
                     continue
                 except Exception as e:
-                    logger.error(f"Error processing message {row[0]}: {e}")
+                    logger.error(f"Error processing message {row['message_id']}: {e}")
                     logger.error(traceback.format_exc())
                     continue
             
@@ -271,9 +290,9 @@ class NewsSummarizer:
 Focus on these types of content:
 1. New features or tools that were announced
 2. Demos or images that got a lot of attention (especially messages with many reactions)
-3. Things that people are excited about or commented on a lot
-4. Focused on AI art and AI tools
-5. Notable achievements or demonstrations
+3. Focus on the things that people seem most excited about or commented/reacted to on a lot
+4. Focus on AI art and AI art-related tools
+5. Call out notable achievements or demonstrations
 6. Important community announcements
 
 IMPORTANT REQUIREMENTS FOR MEDIA AND LINKS:
@@ -284,33 +303,35 @@ IMPORTANT REQUIREMENTS FOR MEDIA AND LINKS:
 7. Prioritize messages with reactions when selecting media to include
 6. Be careful not to bias towards just the first messages.
 8. If a topic has interesting follow-up discussions or examples, include those as subtopics even if they don't have media
+9. Always end with a colon if there are attachments or links ":"
+10: Don't share the same attachment or link multiple times
 
 Return the results in EXACTLY this format with one JSON object per news item:
 
 [
  {
    "title": "BFL ship new Controlnets for FluxText",
-   "mainText": "A new ComfyUI analytics node has been developed to track and analyze data pipeline components, including inputs, outputs, and embeddings. This enhancement aims to provide more controllable prompting capabilities.",
+   "mainText": "A new ComfyUI analytics node has been developed to track and analyze data pipeline components, including inputs, outputs, and embeddings. This enhancement aims to provide more controllable prompting capabilities:",
    "mainFile": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342.mp4, https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425343.png",
    "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342",
    "subTopics": [
      {
-       "text": "Here's another example of Kijai using it in combination with Redux",
+       "text": "Here's another example of Kijai using it in combination with Redux - Kijai noted that it worked better than the previous version:",
        "file": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342.png, https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425344.png",
        "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342"
      },
      {
-       "text": "While here's an example by Gigantosorouus that got a lot of reactions",
+       "text": "While here's an example by Gigantosorouus that got a lot of reactions - Banodocians thought it was impressive:",
        "file": "https://discord.com/channels/1076117621407223829/1138865343314530324/765434534654645.png",
        "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/765434534654645"
      },
      {
-       "text": "Here's a link people for using it in ComfyUI that people found interesting too:",
+       "text": "Here's a link people for using it in ComfyUI that people found interesting too - toyxyz shared that it has native support already:",
        "link": "github.com/froggers/comfydifx",
        "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/765434534654645"
      },
      {
-       "text": "Interesting discussion about performance implications",
+       "text": "Interesting discussion about performance implications - merkwarpper says it runs 10x faster than other tools:",
        "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/765434534654650"
      }
    ]
@@ -325,10 +346,12 @@ Requirements for the response:
    - link (external links)
    - messageLink (required for all subtopics)
    - Both file and link can be included if relevant
-4. All usernames must be in bold with ** (e.g., "**username**") - ALWAYS try to give credit to the creator
-5. If there are no significant news items, respond with exactly "[NO SIGNIFICANT NEWS]"
-6. Include NOTHING other than the JSON response
-7. Don't repeat the same item or leave any empty fields
+4. Always end with a colon if there are attachments or links ":"
+5. All usernames must be in bold with ** (e.g., "**username**") - ALWAYS try to give credit to the creator
+6. If there are no significant news items, respond with exactly "[NO SIGNIFICANT NEWS]"
+7. Include NOTHING other than the JSON response
+8. Don't repeat the same item or leave any empty fields
+9. Always refere to community members as a group as Banodocians 
 
 Here are the messages to analyze:
 
@@ -478,7 +501,7 @@ Here are the messages to analyze:
 
         return conversation
 
-    async def generate_news_summary(self, messages):
+    async def generate_news_summary(self, messages: List[dict]) -> str:
         """Generate a news summary using Claude."""
         if not messages:
             logger.warning("No messages to analyze")
@@ -543,7 +566,7 @@ Here are the messages to analyze:
                 # Start with main topic header and text
                 main_content = [
                     f"## {item['title']}\n",
-                    f"{item['mainText']} (💬: {item['messageLink']})\n"
+                    f"{item['mainText']} {item['messageLink']}\n"
                 ]
                 messages_to_send.append({"content": "\n".join(main_content)})
                 
@@ -552,6 +575,9 @@ Here are the messages to analyze:
                     # Split multiple files and add each as a separate message
                     files = [f.strip() for f in item['mainFile'].split(',')]
                     for file in files:
+                        # Skip Discord CDN links that contain "ex=", "is=", and "hm=" parameters
+                        if "cdn.discordapp.com" in file and all(param in file for param in ["ex=", "is=", "hm="]):
+                            continue
                         messages_to_send.append({"content": f"📎 {file}"})
                 
                 # Add subtopics
@@ -562,7 +588,7 @@ Here are the messages to analyze:
                         
                         # Add text and message link together
                         if 'messageLink' in subtopic:
-                            content.append(f"• {subtopic['text']} (💬: {subtopic['messageLink']})")
+                            content.append(f"• {subtopic['text']} {subtopic['messageLink']}")
                         else:
                             content.append(f"• {subtopic['text']}")
                             
@@ -572,6 +598,9 @@ Here are the messages to analyze:
                         if 'file' in subtopic and not subtopic['file'].startswith('⁠'):
                             files = [f.strip() for f in subtopic['file'].split(',')]
                             for file in files:
+                                # Skip Discord CDN links that contain "ex=", "is=", and "hm=" parameters
+                                if "cdn.discordapp.com" in file and all(param in file for param in ["ex=", "is=", "hm="]):
+                                    continue
                                 messages_to_send.append({"content": f"  📎 {file}"})
                         
                         # Add link if it exists and isn't a placeholder
@@ -586,7 +615,7 @@ Here are the messages to analyze:
         except Exception as e:
             logger.error(f"Error formatting news items: {e}")
             logger.error(traceback.format_exc())
-            return [{"content": news_items_json}]
+            return [{"content": "Error formatting news items"}]
 
     async def post_to_discord(self, news_items, target_channel=None):
         """Post news items to Discord using bot client."""
@@ -601,9 +630,7 @@ Here are the messages to analyze:
                     
                 if isinstance(news_items, str):
                     # Convert string input into list of messages format
-                    if news_items == "[NO SIGNIFICANT NEWS]":
-                        messages = [{"content": "No significant news in the past 24 hours."}]
-                    elif news_items == "[NO MESSAGES TO ANALYZE]":
+                    if news_items == "[NO SIGNIFICANT NEWS]" or news_items == "[NO MESSAGES TO ANALYZE]":
                         messages = [{"content": news_items}]
                     else:
                         # Split into chunks if needed (Discord has 2000 char limit)

@@ -54,11 +54,19 @@ class MessageLogger(discord.Client):
         """Setup hook to initialize any necessary resources."""
         logger.info("Message logger initialized and ready")
         
-    def _prepare_message_data(self, message: discord.Message) -> Dict[str, Any]:
+    async def _prepare_message_data(self, message: discord.Message) -> Dict[str, Any]:
         """Convert a discord message into a format suitable for database storage."""
         try:
             # Calculate total reaction count
             reaction_count = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+            
+            # Get list of unique reactors
+            reactors = []
+            if message.reactions:
+                for reaction in message.reactions:
+                    async for user in reaction.users():
+                        if user.id not in reactors and user.id != self.bot_user_id:
+                            reactors.append(user.id)
             
             # More defensive thread_id handling with logging
             thread_id = None
@@ -102,7 +110,7 @@ class MessageLogger(discord.Client):
                 ],
                 'embeds': [embed.to_dict() for embed in message.embeds],
                 'reaction_count': reaction_count,
-                'reactors': None,  # We don't populate reactors at message creation time
+                'reactors': json.dumps(reactors),  # Store reactors as JSON array
                 'reference_id': message.reference.message_id if message.reference else None,
                 'edited_at': message.edited_at.isoformat() if message.edited_at else None,
                 'is_pinned': message.pinned,
@@ -135,7 +143,7 @@ class MessageLogger(discord.Client):
                 return
                 
             # Prepare and store the message
-            message_data = self._prepare_message_data(message)
+            message_data = await self._prepare_message_data(message)
             self.db.store_messages([message_data])
             
             logger.debug(f"Logged message {message.id} from {message.author.name} in #{message.channel.name}")
@@ -155,7 +163,7 @@ class MessageLogger(discord.Client):
                 return
                 
             # Prepare and store the edited message
-            message_data = self._prepare_message_data(after)
+            message_data = await self._prepare_message_data(after)
             self.db.store_messages([message_data])
             
             logger.debug(f"Logged edited message {after.id} from {after.author.name} in #{after.channel.name}")

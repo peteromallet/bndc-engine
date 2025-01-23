@@ -76,7 +76,7 @@ class DatabaseHandler:
             # Members table
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS members (
-                    id BIGINT PRIMARY KEY,
+                    member_id BIGINT PRIMARY KEY,
                     username TEXT NOT NULL,
                     global_name TEXT,
                     server_nick TEXT,
@@ -113,8 +113,9 @@ class DatabaseHandler:
                     message_type TEXT,
                     flags INTEGER,
                     jump_url TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
                     indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (author_id) REFERENCES members(id),
+                    FOREIGN KEY (author_id) REFERENCES members(member_id),
                     FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
                 )
             """)
@@ -223,6 +224,10 @@ class DatabaseHandler:
                     ))
                 except Exception as e:
                     logger.error(f"Error processing individual message: {e}")
+                    logger.error(f"Conflicting message_id: {message.get('message_id') or message.get('id')}")
+                    logger.error(f"Channel ID: {message.get('channel_id')}")
+                    logger.error(f"Author ID: {message.get('author_id') or (message.get('author', {}).get('id'))}")
+                    logger.error(f"Created at: {message.get('created_at')}")
                     logger.debug(f"Problem message: {json.dumps(message, default=str)}")
                     continue
             
@@ -259,27 +264,14 @@ class DatabaseHandler:
                 
             sql += " ORDER BY m.created_at DESC LIMIT 100"
             
-            self.cursor.execute(sql, params)
-            rows = self.cursor.fetchall()
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute(sql, params)
+            results = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+            self.conn.row_factory = None
             
-            return [{
-                'message_id': row[0],
-                'channel_id': row[1],
-                'author_id': row[2],
-                'content': row[4],
-                'created_at': row[5],
-                'attachments': json.loads(row[6]),
-                'embeds': json.loads(row[7]),
-                'reaction_count': row[8],
-                'reactors': json.loads(row[9]),
-                'reference_id': row[10],
-                'edited_at': row[11],
-                'is_pinned': bool(row[12]),
-                'thread_id': row[13],
-                'message_type': row[14],
-                'flags': row[15],
-                'jump_url': row[16]
-            } for row in rows]
+            return results
             
         except Exception as e:
             logger.error(f"Error searching messages: {e}")
@@ -326,13 +318,17 @@ class DatabaseHandler:
     def get_summary_thread_id(self, channel_id: int) -> Optional[int]:
         """Get the summary thread ID for a channel."""
         try:
-            self.cursor.execute("""
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute("""
                 SELECT summary_thread_id 
                 FROM channel_summary 
                 WHERE channel_id = ?
             """, (channel_id,))
-            result = self.cursor.fetchone()
-            return result[0] if result else None
+            result = cursor.fetchone()
+            cursor.close()
+            self.conn.row_factory = None
+            return result['summary_thread_id'] if result else None
         except sqlite3.Error as e:
             logger.error(f"Error getting summary thread ID: {e}")
             return None
@@ -398,13 +394,18 @@ class DatabaseHandler:
     def get_message_dates(self, channel_id: int) -> List[str]:
         """Get all message dates for a channel to check for gaps."""
         try:
-            self.cursor.execute("""
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute("""
                 SELECT created_at
                 FROM messages 
                 WHERE channel_id = ?
                 ORDER BY created_at
             """, (channel_id,))
-            return [row[0] for row in self.cursor.fetchall()]
+            results = [dict(row)['created_at'] for row in cursor.fetchall()]
+            cursor.close()
+            self.conn.row_factory = None
+            return results
         except Exception as e:
             logger.error(f"Error getting message dates: {e}")
             return []
@@ -412,9 +413,13 @@ class DatabaseHandler:
     def execute_query(self, query: str, params: tuple = ()) -> List[tuple]:
         """Execute a SQL query and return the results."""
         try:
-            self.cursor.execute(query, params)
-            self.conn.commit()  # Commit after each query
-            return self.cursor.fetchall()
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            results = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+            self.conn.row_factory = None
+            return results
         except sqlite3.Error as e:
             logger.error(f"Database error executing query: {query}\nError: {e}")
             self.conn.rollback()
@@ -423,32 +428,19 @@ class DatabaseHandler:
     def get_member(self, member_id: int) -> Optional[Dict]:
         """Get a member by their ID."""
         try:
-            self.cursor.execute("""
-                SELECT id, username, server_nick, global_name, avatar_url, discriminator,
-                       bot, system, accent_color, banner_url, discord_created_at,
-                       guild_join_date, role_ids, created_at, updated_at
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT *
                 FROM members
-                WHERE id = ?
+                WHERE member_id = ?
             """, (member_id,))
-            result = self.cursor.fetchone()
+            result = cursor.fetchone()
+            cursor.close()
+            self.conn.row_factory = None
+            
             if result:
-                return {
-                    'id': result[0],
-                    'username': result[1],
-                    'server_nick': result[2],
-                    'global_name': result[3],
-                    'avatar_url': result[4],
-                    'discriminator': result[5],
-                    'bot': bool(result[6]),
-                    'system': bool(result[7]),
-                    'accent_color': result[8],
-                    'banner_url': result[9],
-                    'discord_created_at': result[10],
-                    'guild_join_date': result[11],
-                    'role_ids': result[12],
-                    'created_at': result[13],
-                    'updated_at': result[14]
-                }
+                return dict(result)
             return None
         except Exception as e:
             logger.error(f"Error getting member {member_id}: {e}")
@@ -483,7 +475,7 @@ class DatabaseHandler:
                             discriminator = ?, bot = ?, system = ?, accent_color = ?,
                             banner_url = ?, discord_created_at = ?, guild_join_date = ?, 
                             role_ids = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
+                        WHERE member_id = ?
                     """, (username, display_name, global_name, avatar_url, 
                           discriminator, bot, system, accent_color,
                           banner_url, discord_created_at, guild_join_date,
@@ -492,7 +484,7 @@ class DatabaseHandler:
                 # Create new member
                 self.cursor.execute("""
                     INSERT INTO members 
-                    (id, username, server_nick, global_name, avatar_url, 
+                    (member_id, username, server_nick, global_name, avatar_url, 
                      discriminator, bot, system, accent_color, banner_url, 
                      discord_created_at, guild_join_date, role_ids)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -510,25 +502,20 @@ class DatabaseHandler:
     def get_channel(self, channel_id: int) -> Optional[Dict]:
         """Get a channel by its ID."""
         try:
-            self.cursor.execute("""
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute("""
                 SELECT channel_id, channel_name, description, suitable_posts, 
                        unsuitable_posts, rules, setup_complete, nsfw, enriched
                 FROM channels
                 WHERE channel_id = ?
             """, (channel_id,))
-            result = self.cursor.fetchone()
+            result = cursor.fetchone()
+            cursor.close()
+            self.conn.row_factory = None
+            
             if result:
-                return {
-                    'channel_id': result[0],
-                    'channel_name': result[1],
-                    'description': result[2],
-                    'suitable_posts': result[3],
-                    'unsuitable_posts': result[4],
-                    'rules': result[5],
-                    'setup_complete': bool(result[6]),
-                    'nsfw': bool(result[7]),
-                    'enriched': bool(result[8])
-                }
+                return dict(result)
             return None
         except Exception as e:
             logger.error(f"Error getting channel {channel_id}: {e}")
