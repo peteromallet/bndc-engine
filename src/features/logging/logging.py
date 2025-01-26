@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import json
+import traceback  # Add at top of file with other imports
 
 from src.common.db_handler import DatabaseHandler
 from dotenv import load_dotenv
@@ -207,35 +208,88 @@ class MessageLogger(discord.Client):
                 return
 
             # Get current message data from database
-            results = self.db.execute_query("""
-                SELECT reaction_count, reactors
-                FROM messages
-                WHERE message_id = ?
-            """, (reaction.message.id,))
+            try:
+                results = self.db.execute_query("""
+                    SELECT reaction_count, reactors
+                    FROM messages
+                    WHERE message_id = ?
+                """, (reaction.message.id,))
 
-            if not results:
-                logger.warning(f"Message {reaction.message.id} not found in database for reaction update")
-                return
+                if not results:
+                    logger.warning(f"Message {reaction.message.id} not found in database for reaction update")
+                    # Check if message exists in Discord but not in DB
+                    try:
+                        msg = await reaction.message.channel.fetch_message(reaction.message.id)
+                        if msg:
+                            logger.error(f"Message exists in Discord but not in database:")
+                            logger.error(f"  Content: {msg.content[:100]}...")
+                            logger.error(f"  Author: {msg.author.name} ({msg.author.id})")
+                            logger.error(f"  Created at: {msg.created_at}")
+                    except Exception as fetch_err:
+                        logger.error(f"Error fetching message from Discord: {fetch_err}")
+                    return
 
-            current_count = results[0][0] or 0  # Default to 0 if None
-            current_reactors_json = results[0][1]
-            current_reactors = json.loads(current_reactors_json) if current_reactors_json else []
+                current_count = results[0].get('reaction_count', 0) or 0  # Default to 0 if None
+                current_reactors_json = results[0].get('reactors')
+                current_reactors = json.loads(current_reactors_json) if current_reactors_json else []
 
-            # Add new reactor if not already in list
-            if user.id not in current_reactors:
-                current_reactors.append(user.id)
+                # Add new reactor if not already in list
+                if user.id not in current_reactors:
+                    current_reactors.append(user.id)
 
-            # Update database with new count and reactors
-            self.db.execute_query("""
-                UPDATE messages
-                SET reaction_count = ?, reactors = ?
-                WHERE message_id = ?
-            """, (current_count + 1, json.dumps(current_reactors), reaction.message.id))
+                # Update database with new count and reactors
+                try:
+                    self.db.execute_query("""
+                        UPDATE messages
+                        SET reaction_count = ?, reactors = ?
+                        WHERE message_id = ?
+                    """, (current_count + 1, json.dumps(current_reactors), reaction.message.id))
+                except Exception as db_error:
+                    logger.error(f"Database error updating reaction: {db_error}")
+                    logger.error(f"Message ID: {reaction.message.id}")
+                    logger.error(f"Channel ID: {reaction.message.channel.id}")
+                    logger.error(f"Channel Name: {reaction.message.channel.name}")
+                    logger.error(f"Reactor ID: {user.id}")
+                    logger.error(f"Reactor Name: {user.name}")
+                    logger.error(f"Reaction: {reaction.emoji}")
+                    logger.error(f"Current Count: {current_count}")
+                    logger.error(f"Current Reactors: {current_reactors}")
+                    logger.error(f"Database Error Traceback:\n{traceback.format_exc()}")
+                    raise
 
-            logger.debug(f"Added reaction from {user.name} to message {reaction.message.id}")
+                logger.debug(f"Added reaction {reaction.emoji} from {user.name} to message {reaction.message.id}")
+
+            except Exception as query_error:
+                logger.error(f"Database query error: {str(query_error)}")
+                logger.error(f"Query Error Traceback:\n{traceback.format_exc()}")
+                raise
 
         except Exception as e:
-            logger.error(f"Error handling reaction add: {e}")
+            logger.error(f"Error handling reaction add: {str(e)}")
+            logger.error(f"Full Error Traceback:\n{traceback.format_exc()}")
+            logger.error(f"Message ID: {getattr(reaction, 'message', None) and reaction.message.id}")
+            logger.error(f"Channel ID: {getattr(reaction, 'message', None) and reaction.message.channel.id}")
+            logger.error(f"Channel Name: {getattr(reaction, 'message', None) and reaction.message.channel.name}")
+            logger.error(f"Reactor ID: {user.id}")
+            logger.error(f"Reactor Name: {user.name}")
+            logger.error(f"Reaction: {getattr(reaction, 'emoji', 'Unknown')}")
+            
+            # Check database state
+            try:
+                msg_check = self.db.execute_query("""
+                    SELECT message_id, channel_id, author_id, content, created_at, 
+                           reaction_count, reactors
+                    FROM messages 
+                    WHERE message_id = ?
+                """, (reaction.message.id,))
+                if msg_check:
+                    logger.error("Current database state for message:")
+                    logger.error(f"  Message exists in DB: {bool(msg_check)}")
+                    logger.error(f"  Stored data: {json.dumps(msg_check[0], indent=2)}")
+                else:
+                    logger.error("Message does not exist in database")
+            except Exception as db_check_err:
+                logger.error(f"Error checking database state: {db_check_err}")
 
     async def on_reaction_remove(self, reaction: discord.Reaction, user: discord.User):
         """Called when a reaction is removed from a message."""

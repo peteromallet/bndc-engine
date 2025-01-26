@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class MessageArchiver(commands.Bot):
-    def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500):
+    def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500, in_depth=False):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
@@ -76,6 +76,11 @@ class MessageArchiver(commands.Bot):
             logger.info(f"Will fetch messages from the last {days} days")
         else:
             logger.info("Will fetch all available messages")
+            
+        # Set in-depth mode
+        self.in_depth = in_depth
+        if in_depth:
+            logger.info("Running in in-depth mode - will perform thorough message checks")
         
         # Add rate limiting tracking
         self.last_api_call = datetime.now()
@@ -256,9 +261,13 @@ class MessageArchiver(commands.Bot):
             message_count = 0
             batch = []
             
-            # If no archived messages exist, get all messages
-            if not earliest_date and not latest_date:
-                logger.info(f"No existing archives found for #{channel.name}. Getting all messages...")
+            # If no archived messages exist or we're in in-depth mode, get all messages in the time range
+            if not earliest_date or not latest_date or self.in_depth:
+                if self.in_depth:
+                    logger.info(f"In-depth mode: Re-checking all messages in time range for #{channel.name}")
+                else:
+                    logger.info(f"No existing archives found for #{channel.name}. Getting all messages...")
+                
                 message_counter = 0
                 logger.info(f"Starting message fetch for #{channel.name} from {'oldest to newest' if self.oldest_first else 'newest to oldest'}...")
                 try:
@@ -290,8 +299,11 @@ class MessageArchiver(commands.Bot):
                                     # Skip messages from the bot
                                     if message.author.id == self.bot_user_id:
                                         continue
-                                        
-                                    current_batch.append(message)
+                                    
+                                    # In in-depth mode, always process the message
+                                    # In normal mode, only process if not already in DB
+                                    if self.in_depth or not self.db.message_exists(message.id):
+                                        current_batch.append(message)
                                     
                                     # Store batch when it reaches the threshold
                                     if len(current_batch) >= 100:
@@ -565,7 +577,7 @@ class MessageArchiver(commands.Bot):
             pass
 
     async def _process_message(self, message, channel_id):
-        """Process a single message and return the processed data."""
+        """Process a single message and store it in the database."""
         try:
             message_start_time = datetime.now()
             
@@ -577,57 +589,59 @@ class MessageArchiver(commands.Bot):
                 reaction_start_time = datetime.now()
                 reactor_ids = set()
                 try:
-                    logger.info(f"Processing reactions for message {message.id}: {len(message.reactions)} types, {reaction_count} total reactions")
-                    
-                    guild = self.get_guild(self.guild_id)
-                    
-                    for reaction in message.reactions:
-                        reaction_process_start = datetime.now()
-                        await self._wait_for_rate_limit()
-                        try:
-                            async for user in reaction.users(limit=50):
-                                reactor_ids.add(user.id)
-                                if hasattr(user, 'id') and not self.db.get_member(user.id):
-                                    logger.debug(f"Fetching new member info for reactor {user.id}")
-                                    await self._wait_for_rate_limit()
-                                    member = guild.get_member(user.id) if guild else None
-                                    role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
-                                    guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
+                    # Always process reactions in in-depth mode, or if the message is new
+                    if self.in_depth or not self.db.message_exists(message.id):
+                        logger.info(f"Processing reactions for message {message.id}: {len(message.reactions)} types, {reaction_count} total reactions")
+                        
+                        guild = self.get_guild(self.guild_id)
+                        
+                        for reaction in message.reactions:
+                            reaction_process_start = datetime.now()
+                            await self._wait_for_rate_limit()
+                            try:
+                                async for user in reaction.users(limit=50):
+                                    reactor_ids.add(user.id)
+                                    if hasattr(user, 'id') and not self.db.get_member(user.id):
+                                        logger.debug(f"Fetching new member info for reactor {user.id}")
+                                        await self._wait_for_rate_limit()
+                                        member = guild.get_member(user.id) if guild else None
+                                        role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
+                                        guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
 
-                                    self.db.create_or_update_member(
-                                        member_id=user.id,
-                                        username=user.name,
-                                        display_name=getattr(user, 'display_name', None),
-                                        global_name=getattr(user, 'global_name', None),
-                                        avatar_url=str(user.avatar.url) if user.avatar else None,
-                                        discriminator=getattr(user, 'discriminator', None),
-                                        bot=getattr(user, 'bot', False),
-                                        system=getattr(user, 'system', False),
-                                        accent_color=getattr(user, 'accent_color', None),
-                                        banner_url=str(user.banner.url) if getattr(user, 'banner', None) else None,
-                                        discord_created_at=user.created_at.isoformat() if hasattr(user, 'created_at') else None,
-                                        guild_join_date=guild_join_date,
-                                        role_ids=role_ids
-                                    )
-                                else:
-                                    logger.debug(f"Using cached member info for reactor {user.id}")
+                                        self.db.create_or_update_member(
+                                            member_id=user.id,
+                                            username=user.name,
+                                            display_name=getattr(user, 'display_name', None),
+                                            global_name=getattr(user, 'global_name', None),
+                                            avatar_url=str(user.avatar.url) if user.avatar else None,
+                                            discriminator=getattr(user, 'discriminator', None),
+                                            bot=getattr(user, 'bot', False),
+                                            system=getattr(user, 'system', False),
+                                            accent_color=getattr(user, 'accent_color', None),
+                                            banner_url=str(user.banner.url) if getattr(user, 'banner', None) else None,
+                                            discord_created_at=user.created_at.isoformat() if hasattr(user, 'created_at') else None,
+                                            guild_join_date=guild_join_date,
+                                            role_ids=role_ids
+                                        )
+                                    else:
+                                        logger.debug(f"Using cached member info for reactor {user.id}")
                                     
-                            reaction_process_duration = (datetime.now() - reaction_process_start).total_seconds()
-                            logger.info(f"Processed reaction {reaction} in {reaction_process_duration:.2f}s")
-                        except discord.Forbidden:
-                            logger.warning(f"Missing permissions to fetch reactors for {reaction} on message {message.id}")
-                            continue
-                        except Exception as e:
-                            logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
-                            continue
-                    
-                    reaction_duration = (datetime.now() - reaction_start_time).total_seconds()
-                    if reaction_duration > 2.0:  # Log slow reaction processing
-                        logger.warning(f"Slow reaction processing for message {message.id}: {reaction_duration:.2f}s")
-                    
-                    # Convert reactor_ids to list if we found any
-                    if reactor_ids:
-                        reactors = list(reactor_ids)
+                                reaction_process_duration = (datetime.now() - reaction_process_start).total_seconds()
+                                logger.info(f"Processed reaction {reaction} in {reaction_process_duration:.2f}s")
+                            except discord.Forbidden:
+                                logger.warning(f"Missing permissions to fetch reactors for {reaction} on message {message.id}")
+                                continue
+                            except Exception as e:
+                                logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
+                                continue
+                        
+                        reaction_duration = (datetime.now() - reaction_start_time).total_seconds()
+                        if reaction_duration > 2.0:  # Log slow reaction processing
+                            logger.warning(f"Slow reaction processing for message {message.id}: {reaction_duration:.2f}s")
+                        
+                        # Convert reactor_ids to list if we found any
+                        if reactor_ids:
+                            reactors = list(reactor_ids)
                 except Exception as e:
                     logger.warning(f"Could not fetch reactors for message {message.id}: {e}")
                 
@@ -658,17 +672,19 @@ class MessageArchiver(commands.Bot):
             # Get the actual channel ID and name (use parent forum for threads)
             actual_channel = message.channel
             thread_id = None
+            
             if hasattr(message.channel, 'parent') and message.channel.parent:
                 actual_channel = message.channel.parent
-                thread_id = message.channel.id  # Store the thread ID before switching to parent
-                logger.debug(f"Message {message.id} is in a thread/forum post. Thread ID: {thread_id}, Parent Forum: {actual_channel.name} (ID: {actual_channel.id})")
-                # Log the type of thread
-                if isinstance(message.channel, discord.Thread):
-                    logger.debug(f"Channel is a regular thread")
-                if hasattr(message.channel, 'thread_type'):
-                    logger.debug(f"Thread type: {message.channel.thread_type}")
+                # Only set thread_id if it's a regular thread, not a forum post
+                if isinstance(message.channel, discord.Thread) and not hasattr(message.channel, 'thread_type'):
+                    thread_id = message.channel.id
+                    logger.debug(f"Message {message.id} is in a thread. Thread ID: {thread_id}, Parent Channel: {actual_channel.name} (ID: {actual_channel.id})")
+                elif hasattr(message.channel, 'thread_type'):
+                    # For forum posts, use the forum post's channel ID as the channel_id
+                    actual_channel = message.channel
+                    logger.debug(f"Message {message.id} is in a forum post. Forum Channel: {actual_channel.name} (ID: {actual_channel.id})")
 
-            # Then create or update the channel using the parent forum's info
+            # Then create or update the channel using the appropriate channel info
             self.db.create_or_update_channel(
                 channel_id=actual_channel.id,
                 channel_name=actual_channel.name,
@@ -750,6 +766,8 @@ def main():
     parser.add_argument('--days', type=int, help='Number of days of history to fetch (default: all)')
     parser.add_argument('--batch-size', type=int, default=100,
                       help='Number of messages to process in each batch (default: 100)')
+    parser.add_argument('--in-depth', action='store_true',
+                      help='Perform thorough message checks, re-processing all messages in the time range')
     args = parser.parse_args()
     
     if args.dev:
@@ -761,7 +779,8 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        bot = MessageArchiver(dev_mode=args.dev, order=args.order, days=args.days, batch_size=args.batch_size)
+        bot = MessageArchiver(dev_mode=args.dev, order=args.order, days=args.days, 
+                            batch_size=args.batch_size, in_depth=args.in_depth)
         
         # Start the bot and keep it running until archiving is complete
         async def runner():

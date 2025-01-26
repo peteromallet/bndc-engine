@@ -78,7 +78,6 @@ def get_desired_daily_summaries_schema() -> List[tuple]:
         ("daily_summary_id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
         ("date", "TEXT NOT NULL"),
         ("channel_id", "BIGINT NOT NULL REFERENCES channels(channel_id)"),
-        ("message_count", "INTEGER NOT NULL"),
         ("full_summary", "TEXT"),
         ("short_summary", "TEXT"),
         ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
@@ -429,10 +428,10 @@ def migrate_daily_summaries(cursor):
             # Copy data, using id as daily_summary_id
             cursor.execute("""
                 INSERT INTO daily_summaries_new 
-                (daily_summary_id, date, channel_id, message_count, 
+                (daily_summary_id, date, channel_id, 
                  full_summary, short_summary, created_at)
                 SELECT 
-                    daily_summary_id, date, channel_id, message_count,
+                    daily_summary_id, date, channel_id,
                     full_summary, short_summary, created_at
                 FROM daily_summaries
             """)
@@ -487,7 +486,6 @@ def migrate_remove_raw_messages(cursor):
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT NOT NULL,
                     channel_id BIGINT NOT NULL,
-                    message_count INTEGER NOT NULL,
                     full_summary TEXT,
                     short_summary TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -499,10 +497,10 @@ def migrate_remove_raw_messages(cursor):
             # Copy data to new table
             cursor.execute("""
                 INSERT INTO daily_summaries_new 
-                (id, date, channel_id, message_count, 
+                (id, date, channel_id, 
                  full_summary, short_summary, created_at)
                 SELECT 
-                    id, date, channel_id, message_count,
+                    id, date, channel_id,
                     full_summary, short_summary, created_at
                 FROM daily_summaries
             """)

@@ -450,12 +450,34 @@ class ChannelSummarizer(commands.Bot):
             self.logger.error(f"Error in on_ready: {e}")
             self.logger.debug(traceback.format_exc())
 
+    async def on_disconnect(self):
+        """Called when the bot disconnects from Discord."""
+        self.logger.warning("Bot disconnected from Discord - attempting to reconnect...")
+        try:
+            # Wait a bit before attempting reconnect
+            await asyncio.sleep(5)
+            
+            if not self.is_closed():
+                self.logger.info("Attempting to reconnect...")
+                # The discord.py library will handle reconnection automatically
+                # We just need to ensure we don't close the bot
+            else:
+                self.logger.warning("Bot was closed - not attempting reconnection")
+                
+        except Exception as e:
+            self.logger.error(f"Error in disconnect handler: {e}")
+            self.logger.debug(traceback.format_exc())
+            
+    async def on_resumed(self):
+        """Called when the bot successfully resumes a session."""
+        self.logger.info("Successfully resumed Discord session")
+
     async def get_channel_history(self, channel_id: int) -> List[dict]:
         """Retrieve recent message history for a channel from the database (past 24h)."""
         self.logger.info(f"Getting message history for channel {channel_id} from database")
         try:
             # Skip date check in dev mode
-            date_condition = "" if self.dev_mode else "AND m.created_at > datetime('now', '-1 day')"
+            date_condition = "" if self.dev_mode else "AND m.created_at > datetime('now', '-24 hours')"
             
             # Just get messages from this specific channel
             query = f"""
@@ -479,8 +501,26 @@ class ChannelSummarizer(commands.Bot):
             self.db.conn.row_factory = sqlite3.Row
             cursor = self.db.conn.cursor()
             cursor.execute(query, (channel_id,))
-            messages = [dict(row) for row in cursor.fetchall()]
+            raw_messages = [dict(row) for row in cursor.fetchall()]
             self.db.conn.row_factory = None
+            
+            # Transform messages to match expected format
+            messages = []
+            for msg in raw_messages:
+                messages.append({
+                    'message_id': msg['message_id'],
+                    'author_id': msg['author_id'],
+                    'channel_id': msg['channel_id'],
+                    'content': msg['content'],
+                    'created_at': msg['created_at'],
+                    'thread_id': msg['thread_id'],
+                    'reference_id': msg['reference_id'],
+                    'attachments': json.loads(msg['attachments']) if msg['attachments'] else [],
+                    'reactions': json.loads(msg['reactors']) if msg['reactors'] else [],
+                    'reaction_count': msg['reaction_count'],
+                    'jump_url': msg['jump_url'],
+                    'author_name': msg['author_name']
+                })
             
             self.logger.info(f"Retrieved {len(messages)} messages for channel {channel_id}")
             return messages
@@ -539,6 +579,17 @@ Full summary to work from:
                 
                 return response.content[0].text.strip()
                     
+            except anthropic.APIError as e:
+                retry_count += 1
+                self.logger.error(f"Claude API error (attempt {retry_count}/{max_retries}): {e}")
+                if retry_count < max_retries:
+                    self.logger.info(f"Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    self.logger.error("All retry attempts failed")
+                    # Return a basic summary without Claude
+                    return f"📨 __{message_count} messages sent__\n• Unable to generate detailed summary due to API error"
+                    
             except asyncio.TimeoutError:
                 retry_count += 1
                 self.logger.error(f"Timeout attempt {retry_count}/{max_retries} while generating short summary")
@@ -547,7 +598,7 @@ Full summary to work from:
                     await asyncio.sleep(5)
                 else:
                     self.logger.error("All retry attempts failed")
-                    return f"__📨 {message_count} messages sent__\n• Error generating summary\u200B"
+                    return f"📨 __{message_count} messages sent__\n• Unable to generate detailed summary due to timeout"
                     
             except Exception as e:
                 retry_count += 1
@@ -557,7 +608,7 @@ Full summary to work from:
                     await asyncio.sleep(5)
                 else:
                     self.logger.error("All retry attempts failed")
-                    return f"__📨 {message_count} messages sent__\n• Error generating summary\u200B"
+                    return f"📨 __{message_count} messages sent__\n• Unable to generate detailed summary due to error"
 
     async def safe_send_message(self, channel, content=None, embed=None, file=None, files=None, reference=None):
         """Safely send a message with concurrency-limited retry logic."""
@@ -719,7 +770,7 @@ Full summary to work from:
             self.logger.info(f"Art channel ID: {art_channel_id}")
             
             # We'll use the DB approach for both dev and prod to keep consistent
-            yesterday = datetime.utcnow() - timedelta(days=1)
+            yesterday = datetime.utcnow() - timedelta(hours=24)
             query = """
                 SELECT 
                     m.message_id,
@@ -784,7 +835,20 @@ Full summary to work from:
                 if top_art['content'] and top_art['content'].strip():
                     # Only add the content if it's not just a video link when we have an attachment
                     if not has_video_link or len(top_art['content'].split()) > 1:
-                        content.append(f"💭 *\"{top_art['content']}\"*")
+                        # Look up usernames for any mention IDs
+                        cursor = self.db.conn.cursor()
+                        def replace_mention(match):
+                            user_id = match.group(1)
+                            cursor.execute("""
+                                SELECT COALESCE(server_nick, global_name, username) as display_name 
+                                FROM members 
+                                WHERE member_id = ?
+                            """, (user_id,))
+                            result = cursor.fetchone()
+                            return f"@{result[0] if result else 'unknown'}"
+                        
+                        escaped_content = re.sub(r'<@!?(\d+)>', replace_mention, top_art['content'])
+                        content.append(f"💭 *\"{escaped_content}\"*")
                 
                 # Only add the attachment URL if we don't have a video link in the content
                 # or if the content has more than just the video link
@@ -821,7 +885,7 @@ Full summary to work from:
         """
         try:
             self.logger.info("Starting post_top_x_generations")
-            yesterday = datetime.utcnow() - timedelta(days=1)
+            yesterday = datetime.utcnow() - timedelta(hours=24)
             
             # Get art sharing channel ID to exclude
             art_channel_id = int(os.getenv('DEV_ART_CHANNEL_ID' if self.dev_mode else 'ART_CHANNEL_ID', 0))
@@ -942,12 +1006,25 @@ Full summary to work from:
                 return None
                 
             desc = [
-                f"## {'Top Generation' if len(top_generations) == 1 else f'Top {len(top_generations)} Generations (last 24h)'}" + (f" in #{first_gen['channel_name']}" if channel_id else "") + "\n",
+                f"## {'Top Generation' if len(top_generations) == 1 else f'Top {len(top_generations)} Generations'}" + (f" in #{first_gen['channel_name']}" if channel_id else "") + "\n",
                 f"1. By **{first_gen['author_name']}**" + (f" in #{first_gen['channel_name']}" if not channel_id else "")
             ]
             
             if first_gen['content'] and first_gen['content'].strip():
-                desc.append(f"💭 *\"{first_gen['content'][:150]}\"*")
+                # Look up usernames for any mention IDs
+                cursor = self.db.conn.cursor()
+                def replace_mention(match):
+                    user_id = match.group(1)
+                    cursor.execute("""
+                        SELECT COALESCE(server_nick, global_name, username) as display_name 
+                        FROM members 
+                        WHERE member_id = ?
+                    """, (user_id,))
+                    result = cursor.fetchone()
+                    return f"@{result[0] if result else 'unknown'}"
+                
+                escaped_content = re.sub(r'<@!?(\d+)>', replace_mention, first_gen['content'][:150])
+                desc.append(f"💭 *\"{escaped_content}\"*")
             
             desc.append(f"🔥 {first_gen['unique_reactor_count']} unique reactions")
             desc.append(video_attachment['url'])
@@ -986,7 +1063,20 @@ Full summary to work from:
                     ]
                     
                     if gen['content'] and gen['content'].strip():
-                        desc.append(f"💭 *\"{gen['content'][:150]}\"*")
+                        # Look up usernames for any mention IDs
+                        cursor = self.db.conn.cursor()
+                        def replace_mention(match):
+                            user_id = match.group(1)
+                            cursor.execute("""
+                                SELECT COALESCE(server_nick, global_name, username) as display_name 
+                                FROM members 
+                                WHERE member_id = ?
+                            """, (user_id,))
+                            result = cursor.fetchone()
+                            return f"@{result[0] if result else 'unknown'}"
+                        
+                        escaped_content = re.sub(r'<@!?(\d+)>', replace_mention, gen['content'][:150])
+                        desc.append(f"💭 *\"{escaped_content}\"*")
                     
                     desc.append(f"🔥 {gen['unique_reactor_count']} unique reactions")
                     desc.append(video_attachment['url'])
@@ -1011,7 +1101,7 @@ Full summary to work from:
         """
         try:
             self.logger.info(f"Posting top gens for channel {channel_id} in thread {thread.name}")
-            yesterday = datetime.utcnow() - timedelta(days=1)
+            yesterday = datetime.utcnow() - timedelta(hours=24)
             
             query = """
                 SELECT 
@@ -1061,7 +1151,7 @@ Full summary to work from:
                 self.logger.info(f"No top generations found for channel {channel_id}")
                 return
 
-            await self.safe_send_message(thread, "\n## 🎬 Top Generations Last 24h\n")
+            await self.safe_send_message(thread, "\n## 🎬 Top Generations\n")
             
             for i, row in enumerate(results, 1):
                 try:
@@ -1081,7 +1171,20 @@ Full summary to work from:
                     ]
                     
                     if row['content'] and row['content'].strip():
-                        desc.append(f"💭 *\"{row['content'][:150]}\"*")
+                        # Look up usernames for any mention IDs
+                        cursor = self.db.conn.cursor()
+                        def replace_mention(match):
+                            user_id = match.group(1)
+                            cursor.execute("""
+                                SELECT COALESCE(server_nick, global_name, username) as display_name 
+                                FROM members 
+                                WHERE member_id = ?
+                            """, (user_id,))
+                            result = cursor.fetchone()
+                            return f"@{result[0] if result else 'unknown'}"
+                        
+                        escaped_content = re.sub(r'<@!?(\d+)>', replace_mention, row['content'][:150])
+                        desc.append(f"💭 *\"{escaped_content}\"*")
                     
                     desc.append(video_attachment['url'])
                     desc.append(f"🔗 Original post: {row['jump_url']}")
@@ -1137,17 +1240,17 @@ Full summary to work from:
     async def generate_summary(self):
         """
         Generate and post summaries following these steps:
-        1) Post daily header to summary channel
-        2) Overall summary of ALL messages (past 24h)
-        3) Top Art Sharing Post
-        4) Top X gens post
-        5) Individual channel summaries
+        1) Generate individual channel summaries and post to their channels
+        2) Combine channel summaries for overall summary
+        3) Post overall summary to summary channel
+        4) Post top generations
+        5) Post top art sharing
         """
         try:
             async with self._summary_lock:
                 self.logger.info("Generating requested summary...")
 
-                # (1) Post the exact daily header to summary channel
+                # Get summary channel
                 summary_channel = self.get_channel(self.summary_channel_id)
                 if not summary_channel:
                     self.logger.error(f"Could not find summary channel {self.summary_channel_id}")
@@ -1155,211 +1258,151 @@ Full summary to work from:
                 
                 current_date = datetime.utcnow()
 
-                # Generate the overall summary using all messages at once
-                news_summarizer = NewsSummarizer(
-                    dev_mode=self.dev_mode,
-                    discord_client=self,
-                    monitored_channels=self.channels_to_monitor
-                )
-                
-                # Get messages from all monitored channels
-                messages = news_summarizer.get_channel_messages()
-                if messages:
-                    self.logger.info(f"Generating overall summary for {len(messages)} messages...")
-                    overall_summary = await news_summarizer.generate_news_summary(messages)
-                    if overall_summary not in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
-                        formatted_summary = news_summarizer.format_news_for_discord(overall_summary)
-                        # Add a header before the main summary
-                        self.first_message = await self.safe_send_message(summary_channel, f"\n\n# Daily Summary - {current_date.strftime('%A, %B %d, %Y')}\n\n")
-                        # Post the main summary directly in the summary channel
-                        self.logger.info("Posting main summary to summary channel")
-                        await news_summarizer.post_to_discord(formatted_summary, summary_channel)
-                    else:
-                        await self.safe_send_message(summary_channel, "_No significant activity to summarize in the last 24 hours._")
-                else:
-                    await self.safe_send_message(summary_channel, "_No messages found in the last 24 hours for overall summary._")
-
-                # (4) Top X gens post and get the top generation
-                await self.post_top_x_generations(summary_channel, limit=4)
-
-                # (3) Top Art Sharing Post
-                await self.post_top_art_share(summary_channel)
-                
-                # Add link back to the start
-                self.logger.info("Attempting to send link back to start...")
-                if self.first_message:
-                    self.logger.info(f"First message exists with ID: {self.first_message.id}")
-                    link_to_start = f"https://discord.com/channels/{self.first_message.guild.id}/{self.first_message.channel.id}/{self.first_message.id}"
-                    self.logger.info(f"Generated link: {link_to_start}")
-                    await self.safe_send_message(summary_channel, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
-                    self.logger.info("Sent link back to start message")
-                else:
-                    self.logger.warning("No first_message found, cannot send link back")
-                
-                # (5) Now process each channel individually
-                if self.dev_mode:
-                    # Get test channel IDs
-                    test_channels = os.getenv("TEST_DATA_CHANNEL", "")
-                    if not test_channels:
-                        self.logger.error("TEST_DATA_CHANNEL not set")
-                        return
-                    
-                    test_channel_ids = [int(cid.strip()) for cid in test_channels.split(',') if cid.strip()]
-                    if not test_channel_ids:
-                        self.logger.error("No valid channel IDs found in TEST_DATA_CHANNEL")
-                        return
-                    
-                    # Select the first test channel ID for individual summaries
-                    test_data_channel_id = test_channel_ids[0]
-                    
-                    # Already selected test_data_channel_id earlier
-                    self.logger.info(f"Using test channel {test_data_channel_id} for individual channel summaries")
-                    
-                    # First check if selected test channel has enough messages
-                    self.db.conn.row_factory = sqlite3.Row
-                    cursor = self.db.conn.cursor()
-                    cursor.execute("""
-                        SELECT COUNT(*) as msg_count
-                        FROM messages
-                        WHERE channel_id = ?
-                        AND created_at > datetime('now', '-1 day')
-                    """, (test_data_channel_id,))
-                    result = cursor.fetchone()
-                    msg_count = result['msg_count'] if result else 0
-                    
-                    if msg_count >= 25:
-                        # Get messages from the selected test channel
-                        test_messages = await self.get_channel_history(test_data_channel_id)
-                        self.logger.info(f"Retrieved {len(test_messages)} messages from test channel {test_data_channel_id}")
-                        
-                        # Process each dev channel
-                        for dev_channel_id in self.dev_channels_to_monitor:
-                            try:
-                                channel_obj = self.get_channel(dev_channel_id)
-                                if not channel_obj:
-                                    self.logger.error(f"Could not find channel object for {dev_channel_id}")
-                                    continue
-                                    
-                                channel_name = channel_obj.name
-                                self.logger.info(f"Processing dev channel {channel_name} ({dev_channel_id})")
-                                
-                                # Create/find monthly thread
-                                current_date = datetime.utcnow()
-                                month_year = current_date.strftime('%B %Y')
-                                thread_name = f"Monthly Summary - {month_year}"
-                                
-                                # Search for existing thread
-                                existing_thread = None
-                                try:
-                                    if channel_obj.guild:
-                                        active_threads = await channel_obj.guild.active_threads()
-                                        if active_threads:
-                                            for th in active_threads:
-                                                if th.parent_id == channel_obj.id and th.name == thread_name:
-                                                    existing_thread = th
-                                                    break
-                                except Exception as e:
-                                    self.logger.error(f"Error searching for existing thread in {channel_name}: {e}")
-                                
-                                if not existing_thread:
-                                    header_message = await self.safe_send_message(
-                                        channel_obj,
-                                        f"# Monthly Summary Thread - {month_year}"
-                                    )
-                                    thread = await self.create_summary_thread(header_message, thread_name)
-                                else:
-                                    thread = existing_thread
-                                
-                                if not thread:
-                                    self.logger.error(f"Failed to create/find monthly thread for {channel_name}")
-                                    continue
-                                
-                                # Generate summaries using test data
-                                channel_summary = await news_summarizer.generate_news_summary(test_messages)
-                                if channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
-                                    continue
-                                
-                                # Get short summary
-                                short_summary = await self.generate_short_summary(channel_summary, msg_count)
-                                
-                                # Post full summary in thread
-                                formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
-                                thread_title = f"# Summary for #{channel_name} for {current_date.strftime('%A, %B %d, %Y')}\n\n"
-                                title_message = await self.safe_send_message(thread, thread_title)
-                                for message in formatted_channel_summary:
-                                    await news_summarizer.post_to_discord([message], thread)
-
-                                # Post short summary in the channel with link to thread
-                                link_to_thread = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                                to_post = [
-                                    f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}",
-                                    short_summary,
-                                    f"[Go to monthly thread for more details]({link_to_thread})"
-                                ]
-                                await self.safe_send_message(channel_obj, "\n".join(to_post))
-
-                                # Post top gens in thread
-                                await self.post_top_gens_for_channel(thread, test_data_channel_id)
-                                
-                                # Add link back to the start of today's summary in this thread
-                                if title_message:
-                                    link_to_start = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                                    await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
-                            except Exception as e:
-                                self.logger.error(f"Error processing dev channel {dev_channel_id}: {e}")
-                                self.logger.debug(traceback.format_exc())
-                                continue
-                else:
-                    # Production mode - process actual channels
-                    # Query to get active channels with message counts
-                    channel_query = """
-                        SELECT 
-                            c.channel_id,
-                            c.channel_name,
-                            COALESCE(c2.channel_name, 'direct') as source,
-                            COUNT(m.message_id) as msg_count
-                        FROM channels c
-                        LEFT JOIN channels c2 ON c.category_id = c2.channel_id
-                        LEFT JOIN messages m ON c.channel_id = m.channel_id
-                            AND m.created_at > datetime('now', '-1 day')
-                        WHERE c.channel_id IN ({})
-                            OR c.category_id IN ({})
-                        GROUP BY c.channel_id, c.channel_name, source
-                        HAVING COUNT(m.message_id) >= 25
-                        ORDER BY msg_count DESC
-                    """.format(
-                        ','.join(str(cid) for cid in self.channels_to_monitor),
-                        ','.join(str(cid) for cid in self.channels_to_monitor)
+                try:
+                    # Initialize news summarizer
+                    news_summarizer = NewsSummarizer(
+                        dev_mode=self.dev_mode,
+                        discord_client=self,
+                        monitored_channels=self.channels_to_monitor
                     )
                     
-                    # Set row factory before creating cursor
-                    self.db.conn.row_factory = sqlite3.Row
-                    cursor = self.db.conn.cursor()
-                    cursor.execute(channel_query)
-                    active_channels = cursor.fetchall()
-                    cursor.close()
-                    self.db.conn.row_factory = None
-                    
+                    # Get active channels with message counts
+                    if self.dev_mode:
+                        # Get test channel IDs for data source
+                        test_channels = os.getenv("TEST_DATA_CHANNEL", "")
+                        if not test_channels:
+                            self.logger.error("TEST_DATA_CHANNEL not set")
+                            return
+                        
+                        test_channel_ids = [int(cid.strip()) for cid in test_channels.split(',') if cid.strip()]
+                        if not test_channel_ids:
+                            self.logger.error("No valid channel IDs found in TEST_DATA_CHANNEL")
+                            return
+                        
+                        # For dev mode, use first test channel as data source
+                        test_data_channel_id = test_channel_ids[0]
+                        self.logger.info(f"Using test channel {test_data_channel_id} as data source")
+                        
+                        # Check if test channel has enough messages
+                        self.db.conn.row_factory = sqlite3.Row
+                        cursor = self.db.conn.cursor()
+                        cursor.execute("""
+                            SELECT COUNT(*) as msg_count
+                            FROM messages
+                            WHERE channel_id = ?
+                        """, (test_data_channel_id,))
+                        result = cursor.fetchone()
+                        msg_count = result['msg_count'] if result else 0
+                        
+                        if msg_count < 25:
+                            self.logger.error(f"Test channel {test_data_channel_id} has insufficient messages ({msg_count})")
+                            return
+                            
+                        # Get messages from test channel
+                        test_messages = await self.get_channel_history(test_data_channel_id)
+                        if not test_messages:
+                            self.logger.error(f"No messages found in test channel {test_data_channel_id}")
+                            return
+                            
+                        self.logger.info(f"Retrieved {len(test_messages)} messages from test channel {test_data_channel_id}")
+                        
+                        # In dev mode, create active_channels from dev_channels_to_monitor
+                        active_channels = []
+                        for dev_channel_id in self.dev_channels_to_monitor:
+                            active_channels.append({
+                                'channel_id': dev_channel_id,
+                                'channel_name': self.get_channel(dev_channel_id).name if self.get_channel(dev_channel_id) else 'unknown',
+                                'source': 'test',
+                                'msg_count': msg_count  # Use test channel message count
+                            })
+                        
+                    else:
+                        # Production mode - use monitored channels
+                        channel_query = """
+                            SELECT 
+                                c.channel_id,
+                                c.channel_name,
+                                COALESCE(c2.channel_name, 'direct') as source,
+                                COUNT(m.message_id) as msg_count
+                            FROM channels c
+                            LEFT JOIN channels c2 ON c.category_id = c2.channel_id
+                            LEFT JOIN messages m ON c.channel_id = m.channel_id
+                                AND m.created_at > datetime('now', '-24 hours')
+                            WHERE c.channel_id IN ({})
+                                OR c.category_id IN ({})
+                            GROUP BY c.channel_id, c.channel_name, source
+                            HAVING COUNT(m.message_id) >= 25
+                            ORDER BY msg_count DESC
+                        """.format(
+                            ','.join(str(cid) for cid in self.channels_to_monitor),
+                            ','.join(str(cid) for cid in self.channels_to_monitor)
+                        )
+                        
+                        # Get active channels
+                        self.db.conn.row_factory = sqlite3.Row
+                        cursor = self.db.conn.cursor()
+                        cursor.execute(channel_query)
+                        active_channels = [dict(row) for row in cursor.fetchall()]
+                        cursor.close()
+                        self.db.conn.row_factory = None
+
+                    # Now process all active channels (either dev or prod)
+                    channel_summaries = []
                     self.logger.info("Processing individual summaries for channels with 25+ messages:")
                     for channel in active_channels:
                         try:
                             self.logger.info(f"  - {channel['channel_name']} ({channel['channel_id']}) [{channel['source']}]: {channel['msg_count']} messages")
                             
                             channel_id = channel['channel_id']
-                            messages = await self.get_channel_history(channel_id)
-                            
                             channel_obj = self.get_channel(channel_id)
                             if not channel_obj:
                                 self.logger.error(f"Could not find channel object for {channel_id}")
                                 continue
-                                
-                            channel_name = channel_obj.name
-                                
-                                # Create/find monthly thread
-                            current_date = datetime.utcnow()
+
+                            # Get messages - use test_messages in dev mode, otherwise get from channel
+                            messages = test_messages if self.dev_mode else await self.get_channel_history(channel_id)
+                            if not messages:
+                                continue
+
+                            # Generate channel summary
+                            channel_summary = await news_summarizer.generate_news_summary(messages)
+                            if channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
+                                continue
+
+                            # Format the summary for Discord
+                            formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
+
+                            # Save summary to database
+                            try:
+                                cursor = self.db.conn.cursor()
+                                cursor.execute("""
+                                    INSERT INTO daily_summaries (
+                                        date,
+                                        channel_id,
+                                        full_summary,
+                                        short_summary,
+                                        created_at
+                                    ) VALUES (?, ?, ?, ?, datetime('now'))
+                                """, (
+                                    current_date.strftime('%Y-%m-%d'),
+                                    channel_id, 
+                                    channel_summary,
+                                    await self.generate_short_summary(channel_summary, len(messages)),
+                                ))
+                                self.db.conn.commit()
+                                self.logger.info(f"Saved summary for channel {channel_id} to database")
+                            except Exception as e:
+                                self.logger.error(f"Failed to save summary to database for channel {channel_id}: {e}")
+                                self.logger.debug(traceback.format_exc())
+
+                            # Add to list for overall summary
+                            channel_summaries.append(channel_summary)
+
+                            # Create/find monthly thread for this channel
                             month_year = current_date.strftime('%B %Y')
                             thread_name = f"Monthly Summary - {month_year}"
                             
+                            # Search for existing thread
                             existing_thread = None
                             try:
                                 if channel_obj.guild:
@@ -1370,8 +1413,8 @@ Full summary to work from:
                                                 existing_thread = th
                                                 break
                             except Exception as e:
-                                self.logger.error(f"Error searching for existing thread: {e}")
-                                
+                                self.logger.error(f"Error searching for existing thread in {channel_obj.name}: {e}")
+                            
                             if not existing_thread:
                                 header_message = await self.safe_send_message(
                                     channel_obj,
@@ -1380,50 +1423,78 @@ Full summary to work from:
                                 thread = await self.create_summary_thread(header_message, thread_name)
                             else:
                                 thread = existing_thread
-
+                            
                             if not thread:
-                                self.logger.error(f"Failed to create/find monthly thread for {channel_name}")
+                                self.logger.error(f"Failed to create/find monthly thread for {channel_obj.name}")
                                 continue
 
-                            # (ii) Get a summary of that channel for the past 24 hours
-                            channel_summary = await news_summarizer.generate_news_summary(messages)
-                            if channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
-                                continue
-
-                            # (iii) Get a summary-of-summary (short summary)
-                            short_summary = await self.generate_short_summary(channel_summary, len(messages))
-
-                            # Format and post the full channel summary inside the thread
-                            formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
-                            
-                            # Add the title and post the full formatted summary in the thread
-                            thread_title = f"\n---\n\n# Summary for #{channel_name} for {current_date.strftime('%A, %B %d, %Y')}\n\n"
-                            
-                            # Post each message in the thread, starting with the title
+                            # Post full summary in thread
+                            thread_title = f"# Summary for #{channel_obj.name} for {current_date.strftime('%A, %B %d, %Y')}\n\n"
                             title_message = await self.safe_send_message(thread, thread_title)
                             for message in formatted_channel_summary:
                                 await news_summarizer.post_to_discord([message], thread)
 
-                            # Then post just the short summary in the channel itself
-                            link_to_thread = f"https://discord.com/channels/{thread.guild.id}/{thread.id}"
+                            # Post short summary in channel with link to thread
+                            link_to_thread = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
                             to_post = [
                                 f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}",
-                                short_summary,
+                                await self.generate_short_summary(channel_summary, len(messages)),
                                 f"[Go to monthly thread for more details]({link_to_thread})"
                             ]
                             await self.safe_send_message(channel_obj, "\n".join(to_post))
 
-                            # (iv) Post top gens in that thread
+                            # Post top gens in thread
                             await self.post_top_gens_for_channel(thread, channel_id)
-                            
+
                             # Add link back to the start of today's summary in this thread
                             if title_message:
                                 link_to_start = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                                await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}")
+                                await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
+
                         except Exception as e:
                             self.logger.error(f"Error processing channel {channel_id}: {e}")
                             self.logger.debug(traceback.format_exc())
                             continue
+
+                    # Generate combined summary from all channel summaries
+                    if channel_summaries:
+                        self.logger.info(f"Combining summaries from {len(channel_summaries)} channels...")
+                        overall_summary = await news_summarizer.combine_channel_summaries(channel_summaries)
+                        
+                        if overall_summary and overall_summary not in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
+                            formatted_summary = news_summarizer.format_news_for_discord(overall_summary)
+                            # Add a header before the main summary
+                            self.first_message = await self.safe_send_message(summary_channel, f"\n\n# Daily Summary - {current_date.strftime('%A, %B %d, %Y')}\n\n")
+                            # Post the main summary directly in the summary channel
+                            self.logger.info("Posting main summary to summary channel")
+                            await news_summarizer.post_to_discord(formatted_summary, summary_channel)
+                        else:
+                            await self.safe_send_message(summary_channel, "_No significant activity to summarize in the last 24 hours._")
+                    else:
+                        await self.safe_send_message(summary_channel, "_No messages found in the last 24 hours for overall summary._")
+
+                except anthropic.APIError as e:
+                    self.logger.error(f"Claude API error during summary generation: {e}")
+                    await self.safe_send_message(summary_channel, "⚠️ Unable to generate summary due to API error. Please check logs.")
+                    # Continue with other parts of the summary that don't require Claude
+
+                # Post top generations
+                await self.post_top_x_generations(summary_channel, limit=4)
+
+                # Post top art sharing
+                await self.post_top_art_share(summary_channel)
+                
+                # Add link back to the start
+                self.logger.info("Attempting to send link back to start...")
+                if self.first_message:
+                    self.logger.info(f"First message exists with ID: {self.first_message.id}")
+                    link_to_start = f"https://discord.com/channels/{self.first_message.guild.id}/{self.first_message.channel.id}/{self.first_message.id}"
+                    self.logger.info(f"Generated link: {link_to_start}")
+                    await self.safe_send_message(summary_channel, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\n\n\u200B")
+                    self.logger.info("Sent link back to start message")
+                else:
+                    self.logger.warning("No first_message found, cannot send link back")
+
         except Exception as e:
             self.logger.error(f"Critical error in summary generation: {e}")
             self.logger.debug(traceback.format_exc())

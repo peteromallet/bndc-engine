@@ -60,10 +60,11 @@ async def run_summarizer(bot, token, run_now):
                 bot.logger.info("Running immediate summary generation...")
                 await asyncio.sleep(2)  # Extra sleep
                 await bot.generate_summary()
-                bot._shutdown_flag = True  # Immediately shutdown after
-                await bot.close()
-                bot_task.cancel()
-                await cleanup_tasks([bot_task])
+                bot._shutdown_flag = True  # Signal shutdown
+                await bot.cleanup()  # Clean up resources
+                await bot.close()  # Close the bot
+                bot_task.cancel()  # Cancel the bot task
+                await cleanup_tasks([bot_task])  # Clean up the task
             else:
                 bot.logger.info("Starting scheduled mode...")
                 # Create and start the scheduler task

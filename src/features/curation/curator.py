@@ -28,6 +28,7 @@ class ArtCurator(commands.Bot):
         
         # Setup logger
         self.logger = logger or logging.getLogger('ArtCurator')
+        self.logger.setLevel(logging.DEBUG)  # Set debug logging
         
         # Initialize variables that will be set by dev_mode setter
         self._dev_mode = None
@@ -35,7 +36,7 @@ class ArtCurator(commands.Bot):
         self.curator_ids = []
         
         # Set initial dev mode (this will trigger the setter to load correct IDs)
-        self.dev_mode = dev_mode
+        self.dev_mode = True  # Always use dev mode for now
         
         # Add a set to track curators currently in rejection flow
         self._active_rejections = set()
@@ -43,11 +44,40 @@ class ArtCurator(commands.Bot):
         # Get BOT_USER_ID from environment
         self.bot_user_id = int(os.getenv('BOT_USER_ID', 0))
         
+        # Dictionary to track messages waiting for reactions
+        self._pending_reactions = {}
+        
         # Register event handlers
         self.setup_events()
         
         # Shutdown flag for clean exit
         self._shutdown_flag = False
+
+    async def cleanup(self):
+        """Cleanup resources before shutdown."""
+        self.logger.info("Starting cleanup...")
+        
+        # Cancel any pending tasks
+        for pending_data in self._pending_reactions.values():
+            if pending_data.get('task'):
+                pending_data['task'].cancel()
+        
+        # Clear tracking dictionaries
+        self._pending_reactions.clear()
+        self._active_rejections.clear()
+        
+        # Close the session
+        if hasattr(self, 'http'):
+            if not self.http._session.closed:
+                await self.http._session.close()
+                self.logger.info("Closed HTTP session")
+        
+        self.logger.info("Cleanup completed")
+
+    async def close(self):
+        """Override close to ensure proper cleanup."""
+        await self.cleanup()
+        await super().close()
         
     @property
     def dev_mode(self):
@@ -187,13 +217,14 @@ class ArtCurator(commands.Bot):
                     except Exception as e:
                         self.logger.error(f"Error editing message: {e}", exc_info=True)
 
-                # Add reaction if the message has valid content
+                # Track valid messages for potential reaction
                 if has_valid_attachment or has_valid_link:
-                    try:
-                        await message.add_reaction('💌')
-                        self.logger.info(f"Added love letter box reaction to message from {message.author}.")
-                    except Exception as e:
-                        self.logger.error(f"Error adding reaction: {e}", exc_info=True)
+                    self._pending_reactions[message.id] = {
+                        'message': message,
+                        'has_other_reaction': False,
+                        'task': None,
+                        'is_new': True  # Flag to indicate this is a new message
+                    }
 
             # Process commands after handling the message
             await self.process_commands(message)
@@ -208,20 +239,162 @@ class ArtCurator(commands.Bot):
             if self.dev_mode:
                 self.logger.debug(f"Raw reaction event received: {payload.emoji}")
             
-            # Check if reaction is love letter box and in art channel
-            if (str(payload.emoji) == '💌' and 
+            # Skip if reaction is from bot
+            if payload.user_id == self.user.id:
+                if self.dev_mode:
+                    self.logger.debug(f"Skipping bot's own reaction for message {payload.message_id}")
+                return
+
+            # Check if in art channel
+            if payload.channel_id == self.art_channel_id:
+                # Get the channel and message
+                channel = self.get_channel(payload.channel_id)
+                if channel is None:
+                    self.logger.error(f"Channel with ID {payload.channel_id} not found.")
+                    return
+
+                try:
+                    message = await channel.fetch_message(payload.message_id)
+                    
+                    # Check if message has valid content
+                    has_valid_attachment = any(
+                        (attachment.content_type and (
+                            attachment.content_type.startswith('image/') or 
+                            attachment.content_type.startswith('video/')
+                        )) or 
+                        (attachment.filename.lower().endswith(
+                            ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg',
+                             '.mp4', '.webm', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v',
+                             '.heic', '.heif',
+                             '.apng')
+                        ))
+                        for attachment in message.attachments
+                    )
+
+                    # Check for valid links
+                    allowed_domains = [
+                        'youtube.com', 'youtu.be',    # YouTube
+                        'vimeo.com',                  # Vimeo
+                        'tiktok.com',                 # TikTok
+                        'streamable.com',             # Streamable
+                        'twitch.tv'                   # Twitch
+                    ]
+                    
+                    links = [word for word in message.content.split() 
+                            if 'http://' in word or 'https://' in word]
+                    has_valid_link = any(
+                        domain in link.lower() 
+                        for domain in allowed_domains 
+                        for link in links
+                    )
+
+                    # If message has valid content
+                    if (has_valid_attachment or has_valid_link):
+                        # Check if we already have either reaction
+                        has_love_letter = False
+                        has_inbox_tray = False
+                        for reaction in message.reactions:
+                            if str(reaction.emoji) == '💌':
+                                async for user in reaction.users():
+                                    if user.id == self.user.id:
+                                        has_love_letter = True
+                                        break
+                            elif str(reaction.emoji) == '📥':
+                                async for user in reaction.users():
+                                    if user.id == self.user.id:
+                                        has_inbox_tray = True
+                                        break
+                            if has_love_letter or has_inbox_tray:
+                                break
+
+                        # If neither reaction exists, proceed with adding inbox tray
+                        if not has_love_letter and not has_inbox_tray:
+                            # If message is already being tracked, update it
+                            if message.id in self._pending_reactions:
+                                pending_data = self._pending_reactions[message.id]
+                                if not pending_data['has_other_reaction']:
+                                    if self.dev_mode:
+                                        self.logger.debug(f"First non-bot reaction detected for tracked message {payload.message_id}")
+                                    pending_data['has_other_reaction'] = True
+                                    
+                                    # Schedule the reaction
+                                    async def add_delayed_reaction(message_id):
+                                        try:
+                                            if self.dev_mode:
+                                                self.logger.debug(f"Starting 5 second delay for reaction on message {message_id}")
+                                            await asyncio.sleep(5)  # Reduced from 30 to 5 for testing
+                                            
+                                            try:
+                                                # Refetch message to ensure it's still valid
+                                                message = await channel.fetch_message(message_id)
+                                                # Check again for either reaction in case one was added during the delay
+                                                has_either_reaction = any(
+                                                    (str(reaction.emoji) in ['💌', '📥'] and 
+                                                    any(user.id == self.user.id async for user in reaction.users()))
+                                                    for reaction in message.reactions
+                                                )
+                                                if not has_either_reaction:
+                                                    await message.add_reaction('📥')
+                                                    self.logger.info(f"Added delayed inbox tray reaction to message from {message.author}.")
+                                            except discord.NotFound:
+                                                self.logger.info(f"Message {message_id} was deleted before adding delayed reaction")
+                                            except Exception as e:
+                                                self.logger.error(f"Error adding delayed reaction: {e}", exc_info=True)
+                                            
+                                            # Clean up tracking
+                                            if message_id in self._pending_reactions:
+                                                del self._pending_reactions[message_id]
+                                                
+                                        except Exception as e:
+                                            self.logger.error(f"Error in delayed reaction task: {e}", exc_info=True)
+                                    
+                                    pending_data['task'] = asyncio.create_task(add_delayed_reaction(message.id))
+                            else:
+                                # For untracked messages, schedule the reaction immediately
+                                if self.dev_mode:
+                                    self.logger.debug(f"Scheduling delayed reaction for untracked message {payload.message_id}")
+                                
+                                async def add_delayed_reaction(message_id):
+                                    try:
+                                        await asyncio.sleep(5)  # Reduced from 30 to 5 for testing
+                                        try:
+                                            message = await channel.fetch_message(message_id)
+                                            # Check again for either reaction in case one was added during the delay
+                                            has_either_reaction = any(
+                                                (str(reaction.emoji) in ['💌', '📥'] and 
+                                                any(user.id == self.user.id async for user in reaction.users()))
+                                                for reaction in message.reactions
+                                            )
+                                            if not has_either_reaction:
+                                                await message.add_reaction('📥')
+                                                self.logger.info(f"Added delayed inbox tray reaction to untracked message from {message.author}.")
+                                        except discord.NotFound:
+                                            self.logger.info(f"Message {message_id} was deleted before adding delayed reaction")
+                                        except Exception as e:
+                                            self.logger.error(f"Error adding delayed reaction: {e}", exc_info=True)
+                                    except Exception as e:
+                                        self.logger.error(f"Error in delayed reaction task: {e}", exc_info=True)
+                                
+                                asyncio.create_task(add_delayed_reaction(payload.message_id))
+
+                except Exception as e:
+                    self.logger.error(f"Error processing reaction: {e}", exc_info=True)
+                    return
+            
+            # Check if reaction is love letter box or inbox tray (for thread creation)
+            if (str(payload.emoji) in ['💌', '📥'] and 
                 payload.channel_id == self.art_channel_id):
                 
                 # Log the reaction details in dev mode
                 if self.dev_mode:
-                    self.logger.debug(f"Love letter reaction - Reactor ID: {payload.user_id}, Bot ID: {self.user.id}")
+                    self.logger.debug(f"Love letter or inbox tray reaction - Reactor ID: {payload.user_id}, Bot ID: {self.user.id}")
                 
                 # Skip if reaction is from any bot
                 if payload.user_id == self.user.id:
                     self.logger.info("Ignoring bot's own reaction")
                     return
                 
-                self.logger.info(f"Love letter box reaction received in art channel from user {payload.user_id}")
+                self.logger.info(f"Love letter or inbox tray reaction received in art channel from user {payload.user_id}")
                 
                 # Get the channel and message
                 channel = self.get_channel(payload.channel_id)
@@ -239,6 +412,16 @@ class ArtCurator(commands.Bot):
                             auto_archive_duration=10080  # Archives after 1 week of inactivity
                         )
                         self.logger.info(f"Created thread {thread.id} for message {message.id}")
+                        
+                        # Remove all inbox tray reactions after thread creation
+                        for reaction in message.reactions:
+                            if str(reaction.emoji) == '📥':
+                                try:
+                                    await message.clear_reaction('📥')
+                                    self.logger.info("Removed inbox tray reactions after thread creation")
+                                except Exception as e:
+                                    self.logger.error(f"Error removing inbox tray reactions: {e}")
+                                break
                         
                         # Delete the system message about thread creation
                         try:
