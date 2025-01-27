@@ -476,8 +476,9 @@ class ChannelSummarizer(commands.Bot):
         """Retrieve recent message history for a channel from the database (past 24h)."""
         self.logger.info(f"Getting message history for channel {channel_id} from database")
         try:
-            # Skip date check in dev mode
-            date_condition = "" if self.dev_mode else "AND m.created_at > datetime('now', '-24 hours')"
+            # Always apply date filter, even in dev mode
+            yesterday = datetime.utcnow() - timedelta(hours=24)
+            date_condition = "AND m.created_at > ?"
             
             # Just get messages from this specific channel
             query = f"""
@@ -500,7 +501,7 @@ class ChannelSummarizer(commands.Bot):
             # Set row factory to return dictionaries
             self.db.conn.row_factory = sqlite3.Row
             cursor = self.db.conn.cursor()
-            cursor.execute(query, (channel_id,))
+            cursor.execute(query, (channel_id, yesterday.isoformat()))
             raw_messages = [dict(row) for row in cursor.fetchall()]
             self.db.conn.row_factory = None
             
@@ -748,12 +749,48 @@ Full summary to work from:
     async def create_summary_thread(self, message, thread_name, is_top_generations=False):
         """Create a thread attached to `message`."""
         try:
+            self.logger.info(f"Attempting to create thread '{thread_name}' for message {message.id}")
+            
+            # Check if message is in a guild
+            if not message.guild:
+                self.logger.error("Cannot create thread: message is not in a guild")
+                return None
+                
+            # Check if bot has required permissions
+            bot_member = message.guild.get_member(self.user.id)
+            if not bot_member:
+                self.logger.error("Cannot find bot member in guild")
+                return None
+                
+            required_permissions = ['create_public_threads', 'send_messages_in_threads']
+            missing_permissions = [perm for perm in required_permissions 
+                                if not getattr(message.channel.permissions_for(bot_member), perm, False)]
+            
+            if missing_permissions:
+                self.logger.error(f"Missing required permissions: {', '.join(missing_permissions)}")
+                return None
+            
+            # Attempt to create the thread
             thread = await message.create_thread(
                 name=thread_name,
                 auto_archive_duration=1440  # 24 hours
             )
-            self.logger.info(f"Created thread: {thread.name}")
-            return thread
+            
+            if thread:
+                self.logger.info(f"Successfully created thread: {thread.name} (ID: {thread.id})")
+                return thread
+            else:
+                self.logger.error("Thread creation returned None")
+                return None
+                
+        except discord.Forbidden as e:
+            self.logger.error(f"Forbidden error creating thread: {e}")
+            self.logger.debug(traceback.format_exc())
+            return None
+        except discord.HTTPException as e:
+            self.logger.error(f"HTTP error creating thread: {e}")
+            self.logger.debug(traceback.format_exc())
+            return None
         except Exception as e:
             self.logger.error(f"Error creating thread: {e}")
             self.logger.debug(traceback.format_exc())
@@ -1313,7 +1350,7 @@ Full summary to work from:
                                 'channel_id': dev_channel_id,
                                 'channel_name': self.get_channel(dev_channel_id).name if self.get_channel(dev_channel_id) else 'unknown',
                                 'source': 'test',
-                                'msg_count': msg_count  # Use test channel message count
+                                'msg_count': len(test_messages)  # Use actual test message count
                             })
                         
                     else:
@@ -1365,12 +1402,28 @@ Full summary to work from:
                                 continue
 
                             # Generate channel summary
-                            channel_summary = await news_summarizer.generate_news_summary(messages)
-                            if channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
-                                continue
+                            try:
+                                channel_summary = await news_summarizer.generate_news_summary(messages)
+                                if channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
+                                    continue
 
-                            # Format the summary for Discord
-                            formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
+                                # Format the summary for Discord
+                                formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
+                                if not formatted_channel_summary:
+                                    self.logger.error(f"Failed to format summary for channel {channel_id}")
+                                    continue
+
+                            except anthropic.BadRequestError as e:
+                                if "prompt is too long" in str(e):
+                                    self.logger.warning(f"Token limit exceeded for channel {channel_id}, attempting with reduced message set")
+                                    # Try again with last 100 messages
+                                    messages = messages[:100]
+                                    channel_summary = await news_summarizer.generate_news_summary(messages)
+                                    if not channel_summary or channel_summary in ["[NOTHING OF NOTE]", "[NO SIGNIFICANT NEWS]", "[NO MESSAGES TO ANALYZE]"]:
+                                        continue
+                                    formatted_channel_summary = news_summarizer.format_news_for_discord(channel_summary)
+                                else:
+                                    raise
 
                             # Save summary to database
                             try:
@@ -1402,54 +1455,102 @@ Full summary to work from:
                             month_year = current_date.strftime('%B %Y')
                             thread_name = f"Monthly Summary - {month_year}"
                             
-                            # Search for existing thread
+                            # Check database for existing thread from this month
                             existing_thread = None
                             try:
-                                if channel_obj.guild:
-                                    active_threads = await channel_obj.guild.active_threads()
-                                    if active_threads:
-                                        for th in active_threads:
-                                            if th.parent_id == channel_obj.id and th.name == thread_name:
-                                                existing_thread = th
-                                                break
+                                cursor = self.db.conn.cursor()
+                                cursor.execute("""
+                                    SELECT summary_thread_id 
+                                    FROM channel_summary 
+                                    WHERE channel_id = ? 
+                                    AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                """, (channel_id,))
+                                result = cursor.fetchone()
+                                
+                                if result and result[0]:
+                                    thread_id = result[0]
+                                    # Try to fetch the thread
+                                    try:
+                                        existing_thread = await self.fetch_channel(thread_id)
+                                        if existing_thread:
+                                            self.logger.info(f"Found existing thread for {channel_obj.name} from database: {thread_id}")
+                                    except discord.NotFound:
+                                        self.logger.warning(f"Thread {thread_id} from database no longer exists")
+                                    except Exception as e:
+                                        self.logger.error(f"Error fetching thread {thread_id}: {e}")
+                                
                             except Exception as e:
-                                self.logger.error(f"Error searching for existing thread in {channel_obj.name}: {e}")
+                                self.logger.error(f"Error checking database for existing thread: {e}")
+                                self.logger.debug(traceback.format_exc())
                             
-                            if not existing_thread:
+                            # Always post short summary in main channel
+                            try:
+                                short_summary = await self.generate_short_summary(channel_summary, len(messages))
                                 header_message = await self.safe_send_message(
                                     channel_obj,
-                                    f"# Monthly Summary Thread - {month_year}"
+                                    f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}\n{short_summary}"
                                 )
-                                thread = await self.create_summary_thread(header_message, thread_name)
-                            else:
+                            except Exception as e:
+                                self.logger.error(f"Error posting short summary for {channel_obj.name}: {e}")
+                                self.logger.debug(traceback.format_exc())
+                                continue
+                            
+                            thread = None
+                            if existing_thread:
                                 thread = existing_thread
+                                self.logger.info(f"Using existing thread for {channel_obj.name}: {thread.name} (ID: {thread.id})")
+                                # Add link to existing thread
+                                try:
+                                    link_to_thread = f"https://discord.com/channels/{thread.guild.id}/{thread.id}"
+                                    await header_message.edit(content=f"{header_message.content}\n[Go to monthly thread for more details]({link_to_thread})")
+                                except Exception as e:
+                                    self.logger.error(f"Error adding link to existing thread: {e}")
+                            else:
+                                # Create new thread from the header message
+                                try:
+                                    thread = await self.create_summary_thread(header_message, thread_name)
+                                    if thread:
+                                        # Store the new thread ID in database
+                                        try:
+                                            cursor = self.db.conn.cursor()
+                                            cursor.execute("""
+                                                INSERT INTO channel_summary 
+                                                (channel_id, summary_thread_id, created_at)
+                                                VALUES (?, ?, datetime('now'))
+                                            """, (channel_id, thread.id))
+                                            self.db.conn.commit()
+                                            self.logger.info(f"Stored new thread ID {thread.id} in database")
+                                        except Exception as e:
+                                            self.logger.error(f"Error storing thread ID in database: {e}")
+                                    else:
+                                        self.logger.error(f"Failed to create thread for {channel_obj.name}")
+                                except Exception as e:
+                                    self.logger.error(f"Error creating new thread for {channel_obj.name}: {e}")
+                                    self.logger.debug(traceback.format_exc())
                             
                             if not thread:
-                                self.logger.error(f"Failed to create/find monthly thread for {channel_obj.name}")
+                                self.logger.error(f"No thread available for {channel_obj.name}, skipping detailed summary")
                                 continue
-
+                            
                             # Post full summary in thread
                             thread_title = f"# Summary for #{channel_obj.name} for {current_date.strftime('%A, %B %d, %Y')}\n\n"
                             title_message = await self.safe_send_message(thread, thread_title)
+                            
                             for message in formatted_channel_summary:
                                 await news_summarizer.post_to_discord([message], thread)
-
-                            # Post short summary in channel with link to thread
-                            link_to_thread = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                            to_post = [
-                                f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}",
-                                await self.generate_short_summary(channel_summary, len(messages)),
-                                f"[Go to monthly thread for more details]({link_to_thread})"
-                            ]
-                            await self.safe_send_message(channel_obj, "\n".join(to_post))
 
                             # Post top gens in thread
                             await self.post_top_gens_for_channel(thread, channel_id)
 
-                            # Add link back to the start of today's summary in this thread
+                            # Add link back to the start of today's summary in thread
                             if title_message:
-                                link_to_start = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                                await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
+                                try:
+                                    link_to_start = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
+                                    await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
+                                except Exception as e:
+                                    self.logger.error(f"Error adding link back to start: {e}")
 
                         except Exception as e:
                             self.logger.error(f"Error processing channel {channel_id}: {e}")
@@ -1500,8 +1601,9 @@ Full summary to work from:
             self.logger.debug(traceback.format_exc())
             raise
         finally:
-            # Ensure cleanup happens after summary generation
-            await self.cleanup()
+            # Only perform cleanup if we're in a shutdown state or if this is a one-time run
+            if self._shutdown_flag:
+                await self.cleanup()
 
 if __name__ == "__main__":
     main()

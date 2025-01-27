@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class MessageArchiver(commands.Bot):
-    def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500, in_depth=False):
+    def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500, in_depth=False, channel_id=None):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
@@ -81,6 +81,11 @@ class MessageArchiver(commands.Bot):
         self.in_depth = in_depth
         if in_depth:
             logger.info("Running in in-depth mode - will perform thorough message checks")
+            
+        # Set specific channel to archive
+        self.target_channel_id = channel_id
+        if channel_id:
+            logger.info(f"Will only archive channel with ID: {channel_id}")
         
         # Add rate limiting tracking
         self.last_api_call = datetime.now()
@@ -135,37 +140,19 @@ class MessageArchiver(commands.Bot):
                 await self.close()
                 return
             
-            # Archive all text channels in the guild
-            for channel in guild.text_channels:
-                if channel.id not in self.skip_channels:
-                    logger.info(f"Starting archive of text channel #{channel.name}")
-                    await self.archive_channel(channel.id)
-            
-            # Debug logging for forum channels
-            logger.info(f"Found {len(guild.forums)} forum channels")
-            for forum in guild.forums:
-                logger.info(f"Found forum channel: #{forum.name} (ID: {forum.id})")
-            
-            # Archive all forum channels and their threads
-            for forum in guild.forums:
-                if forum.id not in self.skip_channels:
-                    logger.info(f"Starting archive of forum channel #{forum.name}")
-                    # Archive the forum posts (threads)
-                    thread_count = 0
-                    async for thread in forum.archived_threads():
-                        thread_count += 1
-                        logger.info(f"Starting archive of forum thread #{thread.name} in {forum.name}")
-                        await self.archive_channel(thread.id)
-                    # Archive active threads
-                    for thread in forum.threads:
-                        thread_count += 1
-                        logger.info(f"Starting archive of active forum thread #{thread.name} in {forum.name}")
-                        await self.archive_channel(thread.id)
-                    logger.info(f"Processed {thread_count} total threads in forum #{forum.name}")
-            
-            # Archive threads in text channels
-            for channel in guild.text_channels:
-                if channel.id not in self.skip_channels:
+            # If a specific channel was requested, only archive that one
+            if self.target_channel_id:
+                channel = self.get_channel(self.target_channel_id)
+                if not channel:
+                    logger.error(f"Could not find channel with ID {self.target_channel_id}")
+                    await self.close()
+                    return
+                
+                logger.info(f"Starting archive of channel #{channel.name}")
+                await self.archive_channel(self.target_channel_id)
+                
+                # Also archive any threads in this channel if it's a text channel
+                if isinstance(channel, discord.TextChannel):
                     logger.info(f"Checking for threads in #{channel.name}")
                     # Archive archived threads
                     async for thread in channel.archived_threads():
@@ -175,6 +162,47 @@ class MessageArchiver(commands.Bot):
                     for thread in channel.threads:
                         logger.info(f"Starting archive of active thread #{thread.name} in {channel.name}")
                         await self.archive_channel(thread.id)
+            else:
+                # Archive all text channels in the guild
+                for channel in guild.text_channels:
+                    if channel.id not in self.skip_channels:
+                        logger.info(f"Starting archive of text channel #{channel.name}")
+                        await self.archive_channel(channel.id)
+                
+                # Debug logging for forum channels
+                logger.info(f"Found {len(guild.forums)} forum channels")
+                for forum in guild.forums:
+                    logger.info(f"Found forum channel: #{forum.name} (ID: {forum.id})")
+                
+                # Archive all forum channels and their threads
+                for forum in guild.forums:
+                    if forum.id not in self.skip_channels:
+                        logger.info(f"Starting archive of forum channel #{forum.name}")
+                        # Archive the forum posts (threads)
+                        thread_count = 0
+                        async for thread in forum.archived_threads():
+                            thread_count += 1
+                            logger.info(f"Starting archive of forum thread #{thread.name} in {forum.name}")
+                            await self.archive_channel(thread.id)
+                        # Archive active threads
+                        for thread in forum.threads:
+                            thread_count += 1
+                            logger.info(f"Starting archive of active forum thread #{thread.name} in {forum.name}")
+                            await self.archive_channel(thread.id)
+                        logger.info(f"Processed {thread_count} total threads in forum #{forum.name}")
+                
+                # Archive threads in text channels
+                for channel in guild.text_channels:
+                    if channel.id not in self.skip_channels:
+                        logger.info(f"Checking for threads in #{channel.name}")
+                        # Archive archived threads
+                        async for thread in channel.archived_threads():
+                            logger.info(f"Starting archive of thread #{thread.name} in {channel.name}")
+                            await self.archive_channel(thread.id)
+                        # Archive active threads
+                        for thread in channel.threads:
+                            logger.info(f"Starting archive of active thread #{thread.name} in {channel.name}")
+                            await self.archive_channel(thread.id)
             
             logger.info("Archiving complete, shutting down bot")
             # Close the bot after archiving
@@ -650,24 +678,32 @@ class MessageArchiver(commands.Bot):
                 # Get guild member object to access join date and roles
                 guild = self.get_guild(self.guild_id)
                 member = guild.get_member(message.author.id) if guild else None
-                role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
-                guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
-
-                self.db.create_or_update_member(
-                    member_id=message.author.id,
-                    username=message.author.name,
-                    display_name=getattr(message.author, 'display_name', None),
-                    global_name=getattr(message.author, 'global_name', None),
-                    avatar_url=str(message.author.avatar.url) if message.author.avatar else None,
-                    discriminator=getattr(message.author, 'discriminator', None),
-                    bot=getattr(message.author, 'bot', False),
-                    system=getattr(message.author, 'system', False),
-                    accent_color=getattr(message.author, 'accent_color', None),
-                    banner_url=str(message.author.banner.url) if getattr(message.author, 'banner', None) else None,
-                    discord_created_at=message.author.created_at.isoformat() if hasattr(message.author, 'created_at') else None,
-                    guild_join_date=guild_join_date,
-                    role_ids=role_ids
-                )
+                
+                # Only update if we have the member object or this is a new member
+                if member or not self.db.get_member(message.author.id):
+                    role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
+                    guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
+                    
+                    logger.debug(f"Processing member {message.author.id} ({message.author.name}) from message {message.id}")
+                    logger.debug(f"Member details - display_name: {getattr(message.author, 'display_name', None)}, global_name: {getattr(message.author, 'global_name', None)}")
+                    
+                    self.db.create_or_update_member(
+                        member_id=message.author.id,
+                        username=message.author.name,
+                        display_name=getattr(message.author, 'display_name', None),
+                        global_name=getattr(message.author, 'global_name', None),
+                        avatar_url=str(message.author.avatar.url) if message.author.avatar else None,
+                        discriminator=getattr(message.author, 'discriminator', None),
+                        bot=getattr(message.author, 'bot', False),
+                        system=getattr(message.author, 'system', False),
+                        accent_color=getattr(message.author, 'accent_color', None),
+                        banner_url=str(message.author.banner.url) if getattr(message.author, 'banner', None) else None,
+                        discord_created_at=message.author.created_at.isoformat() if hasattr(message.author, 'created_at') else None,
+                        guild_join_date=guild_join_date,
+                        role_ids=role_ids
+                    )
+                else:
+                    logger.debug(f"Skipping member update for {message.author.id} ({message.author.name}) - no guild member and already exists in DB")
 
             # Get the actual channel ID and name (use parent forum for threads)
             actual_channel = message.channel
@@ -768,6 +804,8 @@ def main():
                       help='Number of messages to process in each batch (default: 100)')
     parser.add_argument('--in-depth', action='store_true',
                       help='Perform thorough message checks, re-processing all messages in the time range')
+    parser.add_argument('--channel', type=int,
+                      help='ID of a specific channel to archive')
     args = parser.parse_args()
     
     if args.dev:
@@ -780,7 +818,8 @@ def main():
         asyncio.set_event_loop(loop)
         
         bot = MessageArchiver(dev_mode=args.dev, order=args.order, days=args.days, 
-                            batch_size=args.batch_size, in_depth=args.in_depth)
+                            batch_size=args.batch_size, in_depth=args.in_depth,
+                            channel_id=args.channel)
         
         # Start the bot and keep it running until archiving is complete
         async def runner():

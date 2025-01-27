@@ -50,11 +50,12 @@ class DatabaseHandler:
             # Channel summary threads table with foreign key
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS channel_summary (
-                    channel_id BIGINT PRIMARY KEY,
+                    channel_id BIGINT,
                     summary_thread_id BIGINT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+                    FOREIGN KEY (channel_id) REFERENCES channels(channel_id),
+                    PRIMARY KEY (channel_id, created_at)
                 )
             """)
             
@@ -579,31 +580,88 @@ class DatabaseHandler:
             existing_member = self.get_member(member_id)
             if existing_member:
                 # Update existing member if any field changed
-                if (existing_member['username'] != username or 
-                    existing_member['server_nick'] != display_name or
-                    existing_member['global_name'] != global_name or
-                    existing_member['avatar_url'] != avatar_url or
-                    existing_member['discriminator'] != discriminator or
-                    existing_member['bot'] != bot or
-                    existing_member['system'] != system or
-                    existing_member['accent_color'] != accent_color or
-                    existing_member['banner_url'] != banner_url or
-                    existing_member['discord_created_at'] != discord_created_at or
-                    existing_member['guild_join_date'] != guild_join_date or
-                    existing_member['role_ids'] != role_ids):
-                    self.cursor.execute("""
+                changes = []
+                if existing_member['username'] != username:
+                    changes.append(f"username: {existing_member['username']} -> {username}")
+                if existing_member['server_nick'] != display_name:
+                    changes.append(f"server_nick: {existing_member['server_nick']} -> {display_name}")
+                if existing_member['global_name'] != global_name:
+                    changes.append(f"global_name: {existing_member['global_name']} -> {global_name}")
+                if existing_member['avatar_url'] != avatar_url:
+                    changes.append(f"avatar_url changed")
+                if existing_member['discriminator'] != discriminator:
+                    changes.append(f"discriminator: {existing_member['discriminator']} -> {discriminator}")
+                if existing_member['bot'] != bot:
+                    changes.append(f"bot: {existing_member['bot']} -> {bot}")
+                if existing_member['system'] != system:
+                    changes.append(f"system: {existing_member['system']} -> {system}")
+                if existing_member['accent_color'] != accent_color:
+                    changes.append(f"accent_color: {existing_member['accent_color']} -> {accent_color}")
+                if existing_member['banner_url'] != banner_url:
+                    changes.append(f"banner_url changed")
+                if existing_member['discord_created_at'] != discord_created_at:
+                    changes.append(f"discord_created_at: {existing_member['discord_created_at']} -> {discord_created_at}")
+                if existing_member['guild_join_date'] != guild_join_date:
+                    changes.append(f"guild_join_date: {existing_member['guild_join_date']} -> {guild_join_date}")
+                if existing_member['role_ids'] != role_ids:
+                    changes.append(f"role_ids changed")
+
+                if changes:
+                    logger.info(f"Updating member {member_id} ({username}). Changes: {', '.join(changes)}")
+                    # Don't update fields that are None in the new data
+                    update_fields = []
+                    update_values = []
+                    if username is not None:
+                        update_fields.append("username = ?")
+                        update_values.append(username)
+                    if display_name is not None:
+                        update_fields.append("server_nick = ?")
+                        update_values.append(display_name)
+                    if global_name is not None:
+                        update_fields.append("global_name = ?")
+                        update_values.append(global_name)
+                    if avatar_url is not None:
+                        update_fields.append("avatar_url = ?")
+                        update_values.append(avatar_url)
+                    if discriminator is not None:
+                        update_fields.append("discriminator = ?")
+                        update_values.append(discriminator)
+                    if bot is not None:
+                        update_fields.append("bot = ?")
+                        update_values.append(bot)
+                    if system is not None:
+                        update_fields.append("system = ?")
+                        update_values.append(system)
+                    if accent_color is not None:
+                        update_fields.append("accent_color = ?")
+                        update_values.append(accent_color)
+                    if banner_url is not None:
+                        update_fields.append("banner_url = ?")
+                        update_values.append(banner_url)
+                    if discord_created_at is not None:
+                        update_fields.append("discord_created_at = ?")
+                        update_values.append(discord_created_at)
+                    if guild_join_date is not None:
+                        update_fields.append("guild_join_date = ?")
+                        update_values.append(guild_join_date)
+                    if role_ids is not None:
+                        update_fields.append("role_ids = ?")
+                        update_values.append(role_ids)
+                    
+                    update_fields.append("updated_at = CURRENT_TIMESTAMP")
+                    
+                    # Add member_id to values
+                    update_values.append(member_id)
+                    
+                    update_sql = f"""
                         UPDATE members
-                        SET username = ?, server_nick = ?, global_name = ?, avatar_url = ?, 
-                            discriminator = ?, bot = ?, system = ?, accent_color = ?,
-                            banner_url = ?, discord_created_at = ?, guild_join_date = ?, 
-                            role_ids = ?, updated_at = CURRENT_TIMESTAMP
+                        SET {', '.join(update_fields)}
                         WHERE member_id = ?
-                    """, (username, display_name, global_name, avatar_url, 
-                          discriminator, bot, system, accent_color,
-                          banner_url, discord_created_at, guild_join_date,
-                          role_ids, member_id))
+                    """
+                    self.cursor.execute(update_sql, tuple(update_values))
             else:
                 # Create new member
+                logger.info(f"Creating new member {member_id} ({username})")
                 self.cursor.execute("""
                     INSERT INTO members 
                     (member_id, username, server_nick, global_name, avatar_url, 
@@ -618,6 +676,9 @@ class DatabaseHandler:
             return True
         except Exception as e:
             logger.error(f"Error creating/updating member {member_id}: {e}")
+            logger.error(f"Current values - username: {username}, display_name: {display_name}, global_name: {global_name}")
+            if existing_member:
+                logger.error(f"Existing values - username: {existing_member['username']}, server_nick: {existing_member['server_nick']}, global_name: {existing_member['global_name']}")
             self.conn.rollback()
             return False
 
