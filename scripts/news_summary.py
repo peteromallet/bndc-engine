@@ -314,7 +314,7 @@ Otherwise, respond with ONLY a JSON array in this exact format:
    "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342",
    "subTopics": [
      {
-       "text": "Here's another example of Kijai using it in combination with Redux - Kijai noted that it worked better than the previous version:",
+       "text": "Here's another example of **Kijai** using it in combination with **Redux** - **Kijai** noted that it worked better than the previous version:",
        "file": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342.png",
        "messageLink": "https://discord.com/channels/1076117621407223829/1138865343314530324/4532454353425342"
      }
@@ -335,14 +335,14 @@ IMPORTANT REQUIREMENTS FOR MEDIA AND LINKS:
 2. AGGRESSIVELY search for related media - include ALL images, videos, or links that are part of the same discussion. For each topic, try to find at least 2-3 related images/videos/examples if they exist
 3. If you find multiple related pieces of media, include them all in mainFile as a comma-separated list
 4. For each subtopic that references media or a demo, you MUST include both the media link and the Discord message link
-5. Prioritize messages with reactions when selecting media to include
+5. Prioritize messages with reactions or responses when selecting media to include
 6. Be careful not to bias towards just the first messages.
 7. If a topic has interesting follow-up discussions or examples, include those as subtopics even if they don't have media
 8. Always end with a colon if there are attachments or links ":"
-9. Don't share the same attachment or link multiple times
+9. Don't share the same attachment or link multiple times - even across different subtopics
 
 Requirements for the response:
-1. Must be valid JSON in exactly this format
+1. Must be valid JSON in exactly the above format
 2. Each news item must have all fields: title, mainText, mainFile (can be multiple comma-separated), messageLink, and subTopics
 3. subTopics can include:
    - file (can be multiple comma-separated)
@@ -354,7 +354,9 @@ Requirements for the response:
 6. If there are no significant news items, respond with exactly "[NO SIGNIFICANT NEWS]"
 7. Include NOTHING other than the JSON response or "[NO SIGNIFICANT NEWS]"
 8. Don't repeat the same item or leave any empty fields
-9. Always refer to community members as a group as Banodocians 
+9. When you're referring to groups of community members, refer to them as Banodocians 
+10. Don't be hyperbolic or overly enthusiastic
+11. If something seems to be a subjective opinion but still noteworthy, mention it as such: "Draken felt...", etc.
 
 Here are the messages to analyze:
 

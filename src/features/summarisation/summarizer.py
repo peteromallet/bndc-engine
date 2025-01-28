@@ -866,7 +866,7 @@ Full summary to work from:
                 author_display = top_art['author_name']
                 
                 content = [
-                    f"# Top Art Sharing Post by {author_display}"
+                    f"## Top Art Sharing Post by {author_display}"
                 ]
                 
                 if top_art['content'] and top_art['content'].strip():
@@ -1548,7 +1548,7 @@ Full summary to work from:
                             if title_message:
                                 try:
                                     link_to_start = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{title_message.id}"
-                                    await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\u200B\n")
+                                    await self.safe_send_message(thread, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}")
                                 except Exception as e:
                                     self.logger.error(f"Error adding link back to start: {e}")
 
@@ -1591,7 +1591,7 @@ Full summary to work from:
                     self.logger.info(f"First message exists with ID: {self.first_message.id}")
                     link_to_start = f"https://discord.com/channels/{self.first_message.guild.id}/{self.first_message.channel.id}/{self.first_message.id}"
                     self.logger.info(f"Generated link: {link_to_start}")
-                    await self.safe_send_message(summary_channel, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}\n\n\u200B")
+                    await self.safe_send_message(summary_channel, f"\n---\n\n***Click here to jump to the beginning of today's summary:*** {link_to_start}")
                     self.logger.info("Sent link back to start message")
                 else:
                     self.logger.warning("No first_message found, cannot send link back")
