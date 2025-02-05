@@ -28,6 +28,7 @@ from src.common.error_handler import ErrorHandler, handle_errors
 from src.common.rate_limiter import RateLimiter
 from src.common.log_handler import LogHandler
 from scripts.news_summary import NewsSummarizer
+from src.common.base_bot import BaseDiscordBot
 
 # Optional imports for media processing
 try:
@@ -269,24 +270,28 @@ class MessageFormatter:
         
         return chunks
 
-class ChannelSummarizer(commands.Bot):
+class ChannelSummarizer(BaseDiscordBot):
     def __init__(self, logger=None, dev_mode=False):
+        # Initialize intents first
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         intents.messages = True
         intents.members = True
         intents.presences = True
-        intents.reactions = True  # Add reactions intent
+        intents.reactions = True
 
+        # Initialize base class with proper settings
         super().__init__(
             command_prefix="!", 
             intents=intents,
-            heartbeat_timeout=60.0,
-            guild_ready_timeout=10.0,
-            gateway_queue_size=512
+            heartbeat_timeout=60.0,  # Standardized timeout
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
         )
         
+        # Initialize logging first for error reporting
         self._dev_mode = None
         self.logger = logger or logging.getLogger(__name__)
         self.log_handler = LogHandler(
@@ -295,31 +300,38 @@ class ChannelSummarizer(commands.Bot):
             dev_log_file='discord_bot_dev.log'
         )
         
-        self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-        self.session = None
-        
-        self.rate_limiter = RateLimiter()
-        self.attachment_handler = AttachmentHandler()
-        self.message_formatter = MessageFormatter()
-        self.db = DatabaseHandler(dev_mode=dev_mode)
-        self.error_handler = ErrorHandler()
-        
-        self.guild_id = None
-        self.summary_channel_id = None
-        self.channels_to_monitor = []
-        self.dev_channels_to_monitor = []
-        self.first_message = None
-        self._summary_lock = asyncio.Lock()
-        self._shutdown_flag = False
-        self.current_summary_attachments = []
-        self.approved_channels = []
-        self.original_urls = {}  # Add this to store original URLs
-        
-        # Set initial dev mode (this will trigger the setter to load correct IDs)
-        self.dev_mode = dev_mode
-        
-        # Initialize discord_client as self since we inherit from commands.Bot
-        self.discord_client = self
+        try:
+            # Initialize API clients
+            self.claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+            if not self.claude:
+                raise ValueError("Failed to initialize Claude client - missing API key")
+            
+            # Initialize handlers
+            self.rate_limiter = RateLimiter()
+            self.attachment_handler = AttachmentHandler()
+            self.message_formatter = MessageFormatter()
+            self.db = DatabaseHandler(dev_mode=dev_mode)
+            self.error_handler = ErrorHandler()
+            
+            # Initialize state variables
+            self.guild_id = None
+            self.summary_channel_id = None
+            self.channels_to_monitor = []
+            self.dev_channels_to_monitor = []
+            self.first_message = None
+            self._summary_lock = asyncio.Lock()
+            self._shutdown_flag = False
+            self.current_summary_attachments = []
+            self.approved_channels = []
+            self.original_urls = {}
+            
+            # Set initial dev mode (this will trigger the setter to load correct IDs)
+            self.dev_mode = dev_mode
+            
+        except Exception as e:
+            self.logger.error(f"Error during ChannelSummarizer initialization: {e}")
+            self.logger.debug(traceback.format_exc())
+            raise
 
     def setup_logger(self, dev_mode):
         """Initialize or update logger configuration"""
@@ -431,7 +443,8 @@ class ChannelSummarizer(commands.Bot):
     async def on_ready(self):
         """Called when the bot is fully connected."""
         try:
-            self.logger.info(f"Logged in as {self.user}")
+            # Let base class handle connection state first
+            await super().on_ready()
             
             notification_channel = self.get_channel(self.summary_channel_id)
             if not notification_channel:
@@ -449,28 +462,6 @@ class ChannelSummarizer(commands.Bot):
         except Exception as e:
             self.logger.error(f"Error in on_ready: {e}")
             self.logger.debug(traceback.format_exc())
-
-    async def on_disconnect(self):
-        """Called when the bot disconnects from Discord."""
-        self.logger.warning("Bot disconnected from Discord - attempting to reconnect...")
-        try:
-            # Wait a bit before attempting reconnect
-            await asyncio.sleep(5)
-            
-            if not self.is_closed():
-                self.logger.info("Attempting to reconnect...")
-                # The discord.py library will handle reconnection automatically
-                # We just need to ensure we don't close the bot
-            else:
-                self.logger.warning("Bot was closed - not attempting reconnection")
-                
-        except Exception as e:
-            self.logger.error(f"Error in disconnect handler: {e}")
-            self.logger.debug(traceback.format_exc())
-            
-    async def on_resumed(self):
-        """Called when the bot successfully resumes a session."""
-        self.logger.info("Successfully resumed Discord session")
 
     async def get_channel_history(self, channel_id: int) -> List[dict]:
         """Retrieve recent message history for a channel from the database (past 24h)."""
@@ -747,7 +738,9 @@ Full summary to work from:
                         self.logger.warning(f"Failed to remove temporary file {f}: {ex}")
 
     async def create_summary_thread(self, message, thread_name, is_top_generations=False):
-        """Create a thread attached to `message`."""
+        """
+        Create a thread attached to `message`.
+        """
         try:
             self.logger.info(f"Attempting to create thread '{thread_name}' for message {message.id}")
             
@@ -762,7 +755,7 @@ Full summary to work from:
                 self.logger.error("Cannot find bot member in guild")
                 return None
                 
-            required_permissions = ['create_public_threads', 'send_messages_in_threads']
+            required_permissions = ['create_public_threads', 'send_messages_in_threads', 'manage_messages']
             missing_permissions = [perm for perm in required_permissions 
                                 if not getattr(message.channel.permissions_for(bot_member), perm, False)]
             
@@ -778,6 +771,26 @@ Full summary to work from:
             
             if thread:
                 self.logger.info(f"Successfully created thread: {thread.name} (ID: {thread.id})")
+                
+                # Only pin/unpin if this is not a top generations thread
+                if not is_top_generations:
+                    # Unpin any existing pinned messages by the bot
+                    try:
+                        pinned_messages = await message.channel.pins()
+                        for pinned_msg in pinned_messages:
+                            if pinned_msg.author.id == self.user.id:
+                                await pinned_msg.unpin()
+                                self.logger.info(f"Unpinned previous message: {pinned_msg.id}")
+                    except Exception as e:
+                        self.logger.error(f"Error unpinning previous messages: {e}")
+                    
+                    # Pin the new thread's starter message
+                    try:
+                        await message.pin()
+                        self.logger.info(f"Pinned new thread starter message: {message.id}")
+                    except Exception as e:
+                        self.logger.error(f"Error pinning new message: {e}")
+                
                 return thread
             else:
                 self.logger.error("Thread creation returned None")
@@ -1075,7 +1088,8 @@ Full summary to work from:
             if len(top_generations) > 1:
                 thread = await self.create_summary_thread(
                     header_message,
-                    f"Top Generations - {datetime.utcnow().strftime('%B %d, %Y')}"
+                    f"Top Generations - {datetime.utcnow().strftime('%B %d, %Y')}",
+                    is_top_generations=True
                 )
                 
                 if not thread:
@@ -1188,7 +1202,7 @@ Full summary to work from:
                 self.logger.info(f"No top generations found for channel {channel_id}")
                 return
 
-            await self.safe_send_message(thread, "\n## 🎬 Top Generations\n")
+            await self.safe_send_message(thread, "\n## Top Generations\n")
             
             for i, row in enumerate(results, 1):
                 try:
@@ -1247,37 +1261,86 @@ Full summary to work from:
 
     async def cleanup(self):
         """Cleanup resources properly"""
+        if self._shutdown_flag:
+            self.logger.warning("Cleanup already in progress")
+            return
+            
+        self._shutdown_flag = True
+        
         try:
             self.logger.info("Starting cleanup...")
             
             # Close aiohttp session first
-            if hasattr(self, 'session') and self.session and not self.session.closed:
+            if hasattr(self, 'session') and self.session:
                 self.logger.info("Closing aiohttp session...")
-                await self.session.close()
-                await asyncio.sleep(0.5)  # Give it a moment to close cleanly
+                try:
+                    if not self.session.closed:
+                        await self.session.close()
+                        # Wait for all pending requests to complete
+                        await asyncio.sleep(0.5)  # Give it a moment to close cleanly
+                except Exception as e:
+                    self.logger.error(f"Error closing aiohttp session: {e}")
+                finally:
+                    # Ensure session is marked as closed
+                    if hasattr(self.session, '_connector'):
+                        self.session._connector._closed = True
+                    self.session = None  # Clear the reference
             
             # Clean up Claude client
             if hasattr(self, 'claude'):
                 self.logger.info("Cleaning up Claude client...")
                 self.claude = None
             
-            # Close Discord client last
-            if self.discord_client and not self.discord_client.is_closed():
-                self.logger.info("Closing Discord client...")
-                await self.discord_client.close()
-                await asyncio.sleep(0.5)  # Give it a moment to close cleanly
+            # Close database connections
+            if hasattr(self, 'db'):
+                self.logger.info("Closing database connections...")
+                try:
+                    self.db.close()
+                except Exception as e:
+                    self.logger.error(f"Error closing database: {e}")
+                finally:
+                    self.db = None  # Clear the reference
+            
+            # Close Discord client last using base class cleanup
+            self.logger.info("Closing Discord connection...")
+            try:
+                await super().cleanup()
+            except Exception as e:
+                self.logger.error(f"Error in Discord cleanup: {e}")
+                self.logger.debug(traceback.format_exc())
             
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
             self.logger.debug(traceback.format_exc())
-            # Still try to close Discord client even if we had an error
-            if self.discord_client and not self.discord_client.is_closed():
-                await self.discord_client.close()
+        finally:
+            self._shutdown_flag = False
+            
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Ensure cleanup runs when using async context manager"""
+        await self.cleanup()
+        
+    def __del__(self):
+        """Ensure cleanup runs when object is garbage collected"""
+        if not self._shutdown_flag and hasattr(self, 'session') and self.session and not self.session.closed:
+            self.logger.warning("Bot was not properly cleaned up, forcing cleanup in destructor")
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.cleanup())
+                else:
+                    loop.run_until_complete(self.cleanup())
+            except Exception as e:
+                self.logger.error(f"Error in destructor cleanup: {e}")
+
+    def is_forum_channel(self, channel_id: int) -> bool:
+        """Check if a channel is a forum channel."""
+        channel = self.get_channel(channel_id)
+        return isinstance(channel, discord.ForumChannel)
 
     async def generate_summary(self):
         """
         Generate and post summaries following these steps:
-        1) Generate individual channel summaries and post to their channels
+        1) Generate individual channel summaries and post to their channels (except for forum channels)
         2) Combine channel summaries for overall summary
         3) Post overall summary to summary channel
         4) Post top generations
@@ -1487,11 +1550,16 @@ Full summary to work from:
                             
                             # Always post short summary in main channel
                             try:
-                                short_summary = await self.generate_short_summary(channel_summary, len(messages))
-                                header_message = await self.safe_send_message(
-                                    channel_obj,
-                                    f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}\n{short_summary}"
-                                )
+                                # Skip posting individual summaries for forum channels
+                                if not self.is_forum_channel(channel_id):
+                                    short_summary = await self.generate_short_summary(channel_summary, len(messages))
+                                    header_message = await self.safe_send_message(
+                                        channel_obj,
+                                        f"### Channel summary for {current_date.strftime('%A, %B %d, %Y')}\n{short_summary}"
+                                    )
+                                else:
+                                    self.logger.info(f"Skipping individual summary post for forum channel {channel_obj.name}")
+                                    continue
                             except Exception as e:
                                 self.logger.error(f"Error posting short summary for {channel_obj.name}: {e}")
                                 self.logger.debug(traceback.format_exc())

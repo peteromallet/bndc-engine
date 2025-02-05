@@ -12,8 +12,9 @@ import logging
 import sys
 import aiohttp
 from common.db_handler import DatabaseHandler
+from src.common.base_bot import BaseDiscordBot
 
-class SearchAnswerBot(commands.Bot):
+class SearchAnswerBot(BaseDiscordBot):
     def __init__(self):
         # Initialize logger first
         self.logger = logging.getLogger('search_bot')
@@ -27,8 +28,12 @@ class SearchAnswerBot(commands.Bot):
         
         # Initialize the bot with required parameters
         super().__init__(
-            command_prefix="!",  # Set the command prefix
-            intents=intents      # Pass the intents
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=self.logger
         )
         
         # Set up logging before any other operations

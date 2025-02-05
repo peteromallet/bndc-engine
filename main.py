@@ -9,9 +9,9 @@ import traceback
 import time
 import discord
 
-from src.features.curation.curator import ArtCurator
-from src.features.summarisation.summarizer import ChannelSummarizer
-from src.features.logging.logging import MessageLogger
+from src.features.curating.curator import ArtCurator
+from src.features.summarising.summariser import ChannelSummarizer
+from src.features.logging.logger import MessageLogger
 from src.common.log_handler import LogHandler
 
 def setup_logging(dev_mode=False):
@@ -35,17 +35,42 @@ def setup_logging(dev_mode=False):
 
 # Constants
 MAX_RETRIES = 3
-READY_TIMEOUT = 60
+READY_TIMEOUT = 120  # Increased from 60 to 120 seconds
 INITIAL_RETRY_DELAY = 3600  # 1 hour
 MAX_RETRY_WAIT = 24 * 3600  # 24 hours in seconds
+HEARTBEAT_CHECK_INTERVAL = 30  # Check connection every 30 seconds
+
+async def monitor_connection(bot):
+    """Monitor bot connection and heartbeat."""
+    while True:
+        try:
+            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
+            
+            if not bot.is_ready() or not bot._last_heartbeat:
+                continue
+                
+            # Check if we've missed too many heartbeats
+            time_since_heartbeat = (datetime.utcnow() - bot._last_heartbeat).total_seconds()
+            if time_since_heartbeat > 60:  # No heartbeat for 60 seconds
+                bot.logger.warning(f"No heartbeat received for {time_since_heartbeat:.1f}s")
+                # Let discord.py's internal reconnect handle it
+                if bot.ws:
+                    await bot.ws.close(code=1001)
+                    
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            bot.logger.error(f"Error in connection monitor: {e}")
+            bot.logger.debug(traceback.format_exc())
 
 async def run_summarizer(bot, token, run_now):
     """Run the summarizer bot with optional immediate summary generation"""
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create task for bot connection
+            # Create tasks for bot connection and monitoring
             bot_task = asyncio.create_task(bot.start(token))
+            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -110,8 +135,9 @@ async def run_curator(bot, token):
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create task for bot connection
+            # Create tasks for bot connection and monitoring
             bot_task = asyncio.create_task(bot.start(token))
+            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -123,7 +149,7 @@ async def run_curator(bot, token):
             bot.logger.info("Curator bot is ready and fully connected")
                 
             # Wait for the bot task to complete or be cancelled
-            await bot_task
+            await asyncio.gather(bot_task, monitor_task)
             return  # Success - exit the retry loop
                 
         except (TimeoutError, discord.errors.DiscordServerError) as e:
@@ -202,8 +228,9 @@ async def run_logger(bot, token):
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create task for bot connection
+            # Create tasks for bot connection and monitoring
             bot_task = asyncio.create_task(bot.start(token))
+            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -215,7 +242,7 @@ async def run_logger(bot, token):
             bot.logger.info("Logger bot is ready and fully connected")
                 
             # Wait for the bot task to complete or be cancelled
-            await bot_task
+            await asyncio.gather(bot_task, monitor_task)
             return  # Success - exit the retry loop
                 
         except (TimeoutError, discord.errors.DiscordServerError) as e:

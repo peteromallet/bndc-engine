@@ -8,17 +8,26 @@ import traceback  # Add at top of file with other imports
 
 from src.common.db_handler import DatabaseHandler
 from dotenv import load_dotenv
+from src.common.base_bot import BaseDiscordBot
 
 logger = logging.getLogger('MessageLogger')
 
-class MessageLogger(discord.Client):
+class MessageLogger(BaseDiscordBot):
     def __init__(self, dev_mode=False):
-        # Set up discord client with necessary intents
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
-        intents.reactions = True  # Add reactions intent
-        super().__init__(intents=intents)
+        intents.messages = True
+        intents.members = True
+        intents.reactions = True
+
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512
+        )
         
         # Initialize database connection with dev mode
         self.db = DatabaseHandler(dev_mode=dev_mode)

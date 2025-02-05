@@ -6,18 +6,31 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from dotenv import load_dotenv
+import sys
 
+# Add parent directory to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.common.base_bot import BaseDiscordBot
 from src.common.db_handler import DatabaseHandler
 
 logger = logging.getLogger('ReactionBackfill')
 
-class ReactionBackfiller(discord.Client):
+class ReactionBackfiller(BaseDiscordBot):
     def __init__(self, dev_mode=False):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
+        intents.messages = True
         intents.reactions = True
-        super().__init__(intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
+        )
         
         self.dev_mode = dev_mode
         self.db = DatabaseHandler(dev_mode=dev_mode)

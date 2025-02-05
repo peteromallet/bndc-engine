@@ -1,13 +1,14 @@
-# BNDC Engine
+# Hive Mind
 
-A Discord bot that generates comprehensive daily summaries of channel activities using Claude 3.5 Sonnet. The bot monitors specified channels and categories, processes messages, and creates organized summaries with media handling, thread management, and historical archiving capabilities. Lots more coming.
+A Discord bot that turns your community's conversations into a knowledge base - helping you answer questios with it, summarise it, create articles and more. Built with Claude 3.5 Sonnet, it archives, indexes, and makes sense of your community's collective intelligence.
 
 ## Features
 
-- 📊 Daily automated news summaries - both whole community and channel-specific
-- 🗄️ Ongoing and historic archiving of all messages and media
-- 🖌️ Art curation capabilities - assign curators to keep contributions high-quality.
-- 🛠️ Development mode for testing with sample data
+- 🧠 Answers questions about any past discussion, pulling from the community's entire conversation history
+- 📚 Generates daily summaries of all community activity, organized by topic and relevance
+- 🔍 Maintains a searchable archive of all messages, files, and media shared in the community
+- 📝 Creates long-form articles and reports by synthesizing related discussions across channels
+- 🤖 Automatically identifies important discussions, emerging topics, and connects related threads
 
 ## Live Demo
 
@@ -101,5 +102,4 @@ python scripts/cleanup_test_data.py
 
 # Migrate database schema
 python scripts/migrate_db.py
-```
 ```

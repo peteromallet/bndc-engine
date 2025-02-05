@@ -8,22 +8,24 @@ from src.common.log_handler import LogHandler
 import json
 from src.common.db_handler import DatabaseHandler
 import datetime
+from src.common.base_bot import BaseDiscordBot
 
-class ArtCurator(commands.Bot):
+class ArtCurator(BaseDiscordBot):
     def __init__(self, logger=None, dev_mode=False):
-        # Setup intents
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.reactions = True
-        intents.members = True
         intents.guilds = True
-        intents.emojis = True
+        intents.messages = True
+        intents.members = True
+        intents.reactions = True
 
-        # Create bot with admin permissions
         super().__init__(
-            command_prefix='!',
+            command_prefix="!",
             intents=intents,
-            permissions=discord.Permissions(administrator=True)
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
         )
         
         # Setup logger
@@ -464,6 +466,10 @@ class ArtCurator(commands.Bot):
                         await thread.send(f"Make sure to tag \@{message.author.name} in messages to make sure they see your comment!")
                         self.logger.info(f"Added tagging reminder message to thread.")
                         
+                        # Schedule the activity check
+                        asyncio.create_task(self._check_thread_activity(thread, message))
+                        self.logger.info(f"Scheduled activity check for thread {thread.id}")
+                        
                 except Exception as e:
                     self.logger.error(f"Error creating thread: {e}", exc_info=True)
                     return
@@ -687,3 +693,40 @@ class ArtCurator(commands.Bot):
         finally:
             # Make sure we remove the curator from active rejections even if there's an error
             self._active_rejections.remove(user.id)
+
+    async def _check_thread_activity(self, thread, original_message):
+        """Check if a thread has any activity after 30 minutes and delete if inactive."""
+        try:
+            # Wait 30 minutes
+            await asyncio.sleep(1800)  # 30 minutes in seconds
+            
+            # Fetch the thread again to ensure it still exists
+            try:
+                thread = await self.fetch_channel(thread.id)
+            except discord.NotFound:
+                # Thread was already deleted
+                return
+            
+            # Get all messages in the thread
+            messages = []
+            async for msg in thread.history(limit=None, oldest_first=True):
+                messages.append(msg)
+            
+            # If there are only 1 message (the tagging reminder), consider it inactive
+            if len(messages) <= 1:
+                self.logger.info(f"Thread {thread.id} inactive after 30 minutes - deleting")
+                
+                # Delete the thread
+                await thread.delete()
+                
+                try:
+                    # Re-add the inbox reaction to the original message
+                    await original_message.add_reaction('📥')
+                    self.logger.info(f"Re-added inbox reaction to message {original_message.id}")
+                except Exception as e:
+                    self.logger.error(f"Error re-adding reaction: {e}")
+            else:
+                self.logger.info(f"Thread {thread.id} has activity - keeping thread")
+                
+        except Exception as e:
+            self.logger.error(f"Error checking thread activity: {e}", exc_info=True)

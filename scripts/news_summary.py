@@ -350,7 +350,7 @@ Requirements for the response:
    - messageLink (required for all subtopics)
    - Both file and link can be included if relevant
 4. Always end with a colon if there are attachments or links ":"
-5. All usernames must be in bold with ** (e.g., "**username**") - ALWAYS try to give credit to the creator
+5. All usernames must be in bold with ** (e.g., "**username**") - ALWAYS try to give credit to the creator or state if opinions come from a specific person
 6. If there are no significant news items, respond with exactly "[NO SIGNIFICANT NEWS]"
 7. Include NOTHING other than the JSON response or "[NO SIGNIFICANT NEWS]"
 8. Don't repeat the same item or leave any empty fields

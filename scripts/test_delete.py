@@ -10,6 +10,8 @@ import traceback
 # Add parent directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.common.base_bot import BaseDiscordBot
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -21,13 +23,20 @@ logger = logging.getLogger(__name__)
 discord_logger = logging.getLogger('discord')
 discord_logger.setLevel(logging.WARNING)
 
-class MessageDeleter(commands.Bot):
+class MessageDeleter(BaseDiscordBot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guild_messages = True
         logger.info("Initializing bot with intents: %s", intents)
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
+        )
         self.target_user_id = 301463647895683072  # Add target user ID
 
     async def delete_message(self, channel, message_id):

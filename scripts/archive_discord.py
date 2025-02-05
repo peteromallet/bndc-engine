@@ -14,6 +14,7 @@ from typing import Optional, List, Dict
 import json
 from src.common.db_handler import DatabaseHandler
 from src.common.constants import get_database_path
+from src.common.base_bot import BaseDiscordBot
 
 # Configure logging
 logging.basicConfig(
@@ -26,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class MessageArchiver(commands.Bot):
+class MessageArchiver(BaseDiscordBot):
     def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500, in_depth=False, channel_id=None):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -34,7 +35,14 @@ class MessageArchiver(commands.Bot):
         intents.members = True
         intents.messages = True  # This is the correct attribute for message history
         intents.reactions = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
+        )
         
         # Load environment variables
         load_dotenv()
@@ -42,6 +50,9 @@ class MessageArchiver(commands.Bot):
         # Set database path based on mode
         self.db_path = get_database_path(dev_mode)
         self.db = None
+        
+        # Track total messages archived
+        self.total_messages_archived = 0
         
         # Check if token exists
         if not os.getenv('DISCORD_BOT_TOKEN'):
@@ -205,6 +216,7 @@ class MessageArchiver(commands.Bot):
                             await self.archive_channel(thread.id)
             
             logger.info("Archiving complete, shutting down bot")
+            logger.info(f"Total new messages archived across all channels: {self.total_messages_archived}")
             # Close the bot after archiving
             await self.close()
         except Exception as e:
@@ -261,6 +273,9 @@ class MessageArchiver(commands.Bot):
                 channel_id = actual_channel.id
             
             logger.info(f"Starting archive of #{channel.name} at {channel_start_time}")
+            
+            # Initialize message counter for truly new messages
+            new_message_count = 0
             
             # Calculate the cutoff date if days limit is set
             cutoff_date = None
@@ -343,10 +358,13 @@ class MessageArchiver(commands.Bot):
                                                     processed_messages.append(processed_msg)
                                             
                                             if processed_messages:
-                                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name}")
+                                                # Only increment counter for messages that didn't exist before
+                                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                                new_message_count += len(new_messages)
+                                                
+                                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                                                 self.db.store_messages(processed_messages)
-                                                message_count += len(processed_messages)
-                                                logger.info(f"Successfully stored batch of {len(processed_messages)} messages from #{channel.name} (total processed: {message_count})")
                                             
                                             current_batch = []
                                             await asyncio.sleep(0.1)
@@ -376,9 +394,13 @@ class MessageArchiver(commands.Bot):
                                         processed_messages.append(processed_msg)
                                 
                                 if processed_messages:
-                                    logger.info(f"Storing final batch of {len(processed_messages)} messages from #{channel.name}")
+                                    # Only increment counter for messages that didn't exist before
+                                    pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                    new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                    new_message_count += len(new_messages)
+                                    
+                                    logger.info(f"Storing final batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                                     self.db.store_messages(processed_messages)
-                                    message_count += len(processed_messages)
                             except Exception as e:
                                 logger.error(f"Failed to store final batch: {e}")
                                 logger.error(f"Error details: {str(e)}")
@@ -426,11 +448,13 @@ class MessageArchiver(commands.Bot):
                                     processed_messages.append(processed_msg)
                             
                             if processed_messages:
-                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name}")
+                                # Only increment counter for messages that didn't exist before
+                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                new_message_count += len(new_messages)
+                                
+                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                                 self.db.store_messages(processed_messages)
-                                message_count += len(processed_messages)
-                                logger.info(f"Successfully stored batch of {len(processed_messages)} messages from #{channel.name} (total processed: {message_count})")
-                            
                             current_batch = []
                             await asyncio.sleep(0.1)
                         except Exception as e:
@@ -447,9 +471,13 @@ class MessageArchiver(commands.Bot):
                                 processed_messages.append(processed_msg)
                         
                         if processed_messages:
-                            logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name}")
+                            # Only increment counter for messages that didn't exist before
+                            pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                            new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                            new_message_count += len(new_messages)
+                            
+                            logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                             self.db.store_messages(processed_messages)
-                            message_count += len(processed_messages)
                     except Exception as e:
                         logger.error(f"Failed to store batch: {e}")
                         logger.error(f"Error details: {str(e)}")
@@ -483,11 +511,13 @@ class MessageArchiver(commands.Bot):
                                     processed_messages.append(processed_msg)
                             
                             if processed_messages:
-                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name}")
+                                # Only increment counter for messages that didn't exist before
+                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                new_message_count += len(new_messages)
+                                
+                                logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                                 self.db.store_messages(processed_messages)
-                                message_count += len(processed_messages)
-                                logger.info(f"Successfully stored batch of {len(processed_messages)} messages from #{channel.name} (total processed: {message_count})")
-                            
                             current_batch = []
                             await asyncio.sleep(0.1)
                         except Exception as e:
@@ -504,9 +534,13 @@ class MessageArchiver(commands.Bot):
                                 processed_messages.append(processed_msg)
                         
                         if processed_messages:
-                            logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name}")
+                            # Only increment counter for messages that didn't exist before
+                            pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                            new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                            new_message_count += len(new_messages)
+                            
+                            logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                             self.db.store_messages(processed_messages)
-                            message_count += len(processed_messages)
                     except Exception as e:
                         logger.error(f"Failed to store batch: {e}")
                         logger.error(f"Error details: {str(e)}")
@@ -553,9 +587,13 @@ class MessageArchiver(commands.Bot):
                                             processed_messages.append(processed_msg)
                                     
                                     if processed_messages:
-                                        logger.info(f"Storing batch of {len(processed_messages)} messages from gap in #{channel.name}")
+                                        # Only increment counter for messages that didn't exist before
+                                        pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                        new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                        new_message_count += len(new_messages)
+                                        
+                                        logger.info(f"Storing batch of {len(processed_messages)} messages from gap in #{channel.name} ({len(new_messages)} new)")
                                         self.db.store_messages(processed_messages)
-                                        message_count += len(processed_messages)
                                         if gap_message_count % 100 == 0:
                                             logger.info(f"Found {gap_message_count} messages in current gap for #{channel.name}")
                                     
@@ -575,17 +613,22 @@ class MessageArchiver(commands.Bot):
                                         processed_messages.append(processed_msg)
                                 
                                 if processed_messages:
-                                    logger.info(f"Storing final gap batch of {len(processed_messages)} messages from #{channel.name}")
+                                    # Only increment counter for messages that didn't exist before
+                                    pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
+                                    new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                    new_message_count += len(new_messages)
+                                    
+                                    logger.info(f"Storing final gap batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
                                     self.db.store_messages(processed_messages)
-                                    message_count += len(processed_messages)
                             except Exception as e:
                                 logger.error(f"Failed to store batch: {e}")
                                 logger.error(f"Error details: {str(e)}")
                         
                         logger.info(f"Finished gap search in #{channel.name}, found {gap_message_count} messages")
             
-            logger.info(f"Found {message_count} new messages to archive")
-            logger.info(f"Archive complete - processed {message_count} new messages")
+            logger.info(f"Found {new_message_count} new messages to archive in #{channel.name}")
+            logger.info(f"Archive complete - processed {new_message_count} new messages")
+            self.total_messages_archived += new_message_count
             
             channel_duration = (datetime.now() - channel_start_time).total_seconds()
             logger.info(f"Finished archive of #{channel.name} in {channel_duration:.2f}s")

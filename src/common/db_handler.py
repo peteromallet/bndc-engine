@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 from .constants import get_database_path
+import time
 
 logger = logging.getLogger('DiscordBot')
 
@@ -19,7 +20,10 @@ class DatabaseHandler:
             db_dir = Path(self.db_path).parent
             db_dir.mkdir(parents=True, exist_ok=True)
             
-            self.conn = sqlite3.connect(self.db_path)
+            # Configure SQLite for better concurrency
+            self.conn = sqlite3.connect(self.db_path, timeout=30.0)  # Increase timeout
+            self.conn.execute("PRAGMA journal_mode=WAL")  # Use Write-Ahead Logging
+            self.conn.execute("PRAGMA busy_timeout=30000")  # Set busy timeout to 30 seconds
             self.cursor = self.conn.cursor()
             
             # Initialize all tables
@@ -158,143 +162,159 @@ class DatabaseHandler:
             except sqlite3.Error as e:
                 logger.error(f"Error creating index {index_name}: {e}")
 
-    # Message Archive Methods
-    def store_messages(self, messages: List[Dict]):
-        """Store messages in the database."""
-        try:
-            for message in messages:
-                try:
-                    # Get and validate message ID
-                    message_id = message.get('message_id')
-                    if message_id is None:
-                        # Fall back to 'id' if message_id isn't present
-                        message_id = message.get('id')
-                        if message_id is None:
-                            raise ValueError("Message must have either 'message_id' or 'id' field")
-                    
-                    # Check if message exists and update if it does
-                    if self.message_exists(message_id):
-                        self.update_message(message)
-                        continue
+    def _execute_with_retry(self, operation, *args, max_retries=3, initial_delay=0.1):
+        """Execute a database operation with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                return operation(*args)
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Database locked, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Database operation failed: {e}")
+                raise
 
-                    # If message doesn't exist, proceed with insert as before
-                    # Ensure all fields are properly serialized
-                    attachments = message.get('attachments', [])
-                    embeds = message.get('embeds', [])
-                    reactors = message.get('reactors', [])
-                    
-                    # Convert to empty lists if None or 'null'
-                    if attachments is None or attachments == 'null':
-                        attachments = []
-                    if embeds is None or embeds == 'null':
-                        embeds = []
-                    if reactors is None or reactors == 'null':
-                        reactors = []
-                    
-                    attachments_json = json.dumps(attachments if isinstance(attachments, (list, dict)) else [])
-                    embeds_json = json.dumps(embeds if isinstance(embeds, (list, dict)) else [])
-                    reactors_json = json.dumps(reactors if isinstance(reactors, (list, dict)) else [])
-                    
-                    created_at = message.get('created_at')
-                    if created_at:
-                        created_at = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
-                    edited_at = message.get('edited_at')
-                    if edited_at:
-                        edited_at = edited_at.isoformat() if hasattr(edited_at, 'isoformat') else str(edited_at)
-                    
+    def store_messages(self, messages: List[Dict]):
+        """Store messages in the database with retry logic."""
+        def _store_operation():
+            try:
+                for message in messages:
                     try:
-                        self.cursor.execute("""
-                            INSERT INTO messages 
-                            (message_id, channel_id, author_id,
-                             content, created_at, attachments, embeds, reaction_count, 
-                             reactors, reference_id, edited_at, is_pinned, thread_id, 
-                             message_type, flags, jump_url)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            message_id,  # Use Discord's message ID as primary key
-                            message.get('channel_id'),
-                            message.get('author_id') or (message.get('author', {}).get('id')),
-                            message.get('content'),
-                            created_at,
-                            attachments_json,
-                            embeds_json,
-                            message.get('reaction_count', 0),
-                            reactors_json,
-                            message.get('reference_id'),
-                            edited_at,
-                            message.get('is_pinned', False),
-                            message.get('thread_id'),
-                            message.get('message_type'),
-                            message.get('flags', 0),
-                            message.get('jump_url')
-                        ))
-                    except sqlite3.IntegrityError as e:
-                        if "UNIQUE constraint failed" in str(e):
-                            # Fetch the existing message from the database
+                        # Get and validate message ID
+                        message_id = message.get('message_id')
+                        if message_id is None:
+                            # Fall back to 'id' if message_id isn't present
+                            message_id = message.get('id')
+                            if message_id is None:
+                                raise ValueError("Message must have either 'message_id' or 'id' field")
+                        
+                        # Check if message exists and update if it does
+                        if self.message_exists(message_id):
+                            self.update_message(message)
+                            continue
+
+                        # If message doesn't exist, proceed with insert as before
+                        # Ensure all fields are properly serialized
+                        attachments = message.get('attachments', [])
+                        embeds = message.get('embeds', [])
+                        reactors = message.get('reactors', [])
+                        
+                        # Convert to empty lists if None or 'null'
+                        if attachments is None or attachments == 'null':
+                            attachments = []
+                        if embeds is None or embeds == 'null':
+                            embeds = []
+                        if reactors is None or reactors == 'null':
+                            reactors = []
+                        
+                        attachments_json = json.dumps(attachments if isinstance(attachments, (list, dict)) else [])
+                        embeds_json = json.dumps(embeds if isinstance(embeds, (list, dict)) else [])
+                        reactors_json = json.dumps(reactors if isinstance(reactors, (list, dict)) else [])
+                        
+                        created_at = message.get('created_at')
+                        if created_at:
+                            created_at = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
+                        edited_at = message.get('edited_at')
+                        if edited_at:
+                            edited_at = edited_at.isoformat() if hasattr(edited_at, 'isoformat') else str(edited_at)
+                        
+                        try:
                             self.cursor.execute("""
-                                SELECT message_id, channel_id, author_id, content, created_at, 
-                                       attachments, embeds, reaction_count, reactors, edited_at
-                                FROM messages 
-                                WHERE message_id = ?
-                            """, (message_id,))
-                            existing_msg = self.cursor.fetchone()
-                            
-                            logger.error("UNIQUE constraint failure details:")
-                            logger.error(f"Attempted to insert message:")
-                            logger.error(f"  Message ID: {message_id}")
-                            logger.error(f"  Channel ID: {message.get('channel_id')}")
-                            logger.error(f"  Author ID: {message.get('author_id') or (message.get('author', {}).get('id'))}")
-                            logger.error(f"  Content: {message.get('content')}")
-                            logger.error(f"  Created at: {created_at}")
-                            logger.error(f"  Reaction count: {message.get('reaction_count', 0)}")
-                            logger.error(f"  Thread ID: {message.get('thread_id')}")
-                            
-                            if existing_msg:
-                                logger.error("Existing message in database:")
-                                logger.error(f"  Message ID: {existing_msg[0]}")
-                                logger.error(f"  Channel ID: {existing_msg[1]}")
-                                logger.error(f"  Author ID: {existing_msg[2]}")
-                                logger.error(f"  Content: {existing_msg[3]}")
-                                logger.error(f"  Created at: {existing_msg[4]}")
-                                logger.error(f"  Reaction count: {existing_msg[7]}")
+                                INSERT INTO messages 
+                                (message_id, channel_id, author_id,
+                                 content, created_at, attachments, embeds, reaction_count, 
+                                 reactors, reference_id, edited_at, is_pinned, thread_id, 
+                                 message_type, flags, jump_url)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                message_id,  # Use Discord's message ID as primary key
+                                message.get('channel_id'),
+                                message.get('author_id') or (message.get('author', {}).get('id')),
+                                message.get('content'),
+                                created_at,
+                                attachments_json,
+                                embeds_json,
+                                message.get('reaction_count', 0),
+                                reactors_json,
+                                message.get('reference_id'),
+                                edited_at,
+                                message.get('is_pinned', False),
+                                message.get('thread_id'),
+                                message.get('message_type'),
+                                message.get('flags', 0),
+                                message.get('jump_url')
+                            ))
+                        except sqlite3.IntegrityError as e:
+                            if "UNIQUE constraint failed" in str(e):
+                                # Fetch the existing message from the database
+                                self.cursor.execute("""
+                                    SELECT message_id, channel_id, author_id, content, created_at, 
+                                           attachments, embeds, reaction_count, reactors, edited_at
+                                    FROM messages 
+                                    WHERE message_id = ?
+                                """, (message_id,))
+                                existing_msg = self.cursor.fetchone()
                                 
-                                # Check if messages are identical
-                                differences = []
-                                if message.get('channel_id') != existing_msg[1]:
-                                    differences.append(f"Channel ID: {message.get('channel_id')} vs {existing_msg[1]}")
-                                if message.get('author_id') != existing_msg[2]:
-                                    differences.append(f"Author ID: {message.get('author_id')} vs {existing_msg[2]}")
-                                if message.get('content') != existing_msg[3]:
-                                    differences.append("Content differs")
-                                if created_at != existing_msg[4]:
-                                    differences.append(f"Created at: {created_at} vs {existing_msg[4]}")
+                                logger.error("UNIQUE constraint failure details:")
+                                logger.error(f"Attempted to insert message:")
+                                logger.error(f"  Message ID: {message_id}")
+                                logger.error(f"  Channel ID: {message.get('channel_id')}")
+                                logger.error(f"  Author ID: {message.get('author_id') or (message.get('author', {}).get('id'))}")
+                                logger.error(f"  Content: {message.get('content')}")
+                                logger.error(f"  Created at: {created_at}")
+                                logger.error(f"  Reaction count: {message.get('reaction_count', 0)}")
+                                logger.error(f"  Thread ID: {message.get('thread_id')}")
                                 
-                                if differences:
-                                    logger.error("Differences found between messages:")
-                                    for diff in differences:
-                                        logger.error(f"  {diff}")
+                                if existing_msg:
+                                    logger.error("Existing message in database:")
+                                    logger.error(f"  Message ID: {existing_msg[0]}")
+                                    logger.error(f"  Channel ID: {existing_msg[1]}")
+                                    logger.error(f"  Author ID: {existing_msg[2]}")
+                                    logger.error(f"  Content: {existing_msg[3]}")
+                                    logger.error(f"  Created at: {existing_msg[4]}")
+                                    logger.error(f"  Reaction count: {existing_msg[7]}")
+                                    
+                                    # Check if messages are identical
+                                    differences = []
+                                    if message.get('channel_id') != existing_msg[1]:
+                                        differences.append(f"Channel ID: {message.get('channel_id')} vs {existing_msg[1]}")
+                                    if message.get('author_id') != existing_msg[2]:
+                                        differences.append(f"Author ID: {message.get('author_id')} vs {existing_msg[2]}")
+                                    if message.get('content') != existing_msg[3]:
+                                        differences.append("Content differs")
+                                    if created_at != existing_msg[4]:
+                                        differences.append(f"Created at: {created_at} vs {existing_msg[4]}")
+                                    
+                                    if differences:
+                                        logger.error("Differences found between messages:")
+                                        for diff in differences:
+                                            logger.error(f"  {diff}")
+                                    else:
+                                        logger.error("Messages appear to be identical - likely duplicate insert attempt")
                                 else:
-                                    logger.error("Messages appear to be identical - likely duplicate insert attempt")
-                            else:
-                                logger.error("Could not find existing message in database despite UNIQUE constraint failure")
-                        raise
-                    
-                except Exception as e:
-                    logger.error(f"Error processing individual message: {e}")
-                    logger.error(f"Conflicting message_id: {message.get('message_id') or message.get('id')}")
-                    logger.error(f"Channel ID: {message.get('channel_id')}")
-                    logger.error(f"Author ID: {message.get('author_id') or (message.get('author', {}).get('id'))}")
-                    logger.error(f"Created at: {message.get('created_at')}")
-                    logger.debug(f"Problem message: {json.dumps(message, default=str)}")
-                    continue
-            
-            self.conn.commit()
-            logger.debug(f"Stored {len(messages)} messages")
-            
-        except Exception as e:
-            logger.error(f"Error storing messages: {e}")
-            self.conn.rollback()
-            raise
+                                    logger.error("Could not find existing message in database despite UNIQUE constraint failure")
+                            raise
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing individual message: {e}")
+                        logger.error(f"Conflicting message_id: {message.get('message_id') or message.get('id')}")
+                        logger.error(f"Channel ID: {message.get('channel_id')}")
+                        logger.error(f"Author ID: {message.get('author_id') or (message.get('author', {}).get('id'))}")
+                        logger.error(f"Created at: {message.get('created_at')}")
+                        logger.debug(f"Problem message: {json.dumps(message, default=str)}")
+                        continue
+                
+                self.conn.commit()
+                logger.debug(f"Stored {len(messages)} messages")
+            except Exception as e:
+                self.conn.rollback()
+                raise
+
+        return self._execute_with_retry(_store_operation)
 
     def get_last_message_id(self, channel_id: int) -> Optional[int]:
         """Get the ID of the last archived message for a channel."""

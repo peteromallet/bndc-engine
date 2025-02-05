@@ -16,18 +16,26 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Now we can import from src
 from src.common.rate_limiter import RateLimiter
+from src.common.base_bot import BaseDiscordBot
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class FileDownloader(commands.Bot):
+class FileDownloader(BaseDiscordBot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         intents.messages = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
+        )
         self.rate_limiter = RateLimiter()
         self.download_tasks = []
         self.selected_type = 'images'  # Change as needed

@@ -6,12 +6,14 @@ from dotenv import load_dotenv, set_key
 import os
 import sys
 import argparse
+import traceback
 
 # Add parent directory to Python path BEFORE importing from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.common.constants import get_database_path
 from src.common.db_handler import DatabaseHandler
+from src.common.base_bot import BaseDiscordBot
 
 # Configure logging
 logging.basicConfig(
@@ -89,13 +91,20 @@ def main():
     # Run the bot
     asyncio.run(cleanup())
 
-class ChannelCleaner(commands.Bot):
+class ChannelCleaner(BaseDiscordBot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guild_messages = True
         intents.voice_states = False
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            heartbeat_timeout=120.0,
+            guild_ready_timeout=30.0,
+            gateway_queue_size=512,
+            logger=logger
+        )
         self.target_user_id = 301463647895683072
 
     async def delete_messages(self, channel):
